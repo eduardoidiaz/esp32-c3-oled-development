@@ -20,6 +20,9 @@
 
 #include "services/gatt/ble_svc_gatt.h"
 
+#include <i2cdev.h>
+#include <dps310.h>
+
 // 🎯 GLOBAL STATIC 128-BIT UUID INSTANCES
 // static const ble_uuid128_t custom_svc_uuid = {
 //     .u.type = BLE_UUID_TYPE_128,
@@ -201,6 +204,44 @@ void draw_string(int x, int y, const char *str) {
     }
 }
 
+// Global device descriptor instance
+static dps310_t dps_sensor_dev;
+
+void init_barometer(void) {
+    // 1. Initialize the baseline i2cdev helper library layer
+    ESP_ERROR_CHECK(i2cdev_init());
+
+    // 2. Clear descriptions safely out of tracking RAM layout spaces
+    memset(&dps_sensor_dev, 0, sizeof(dps310_t));
+
+    // 3. Initialize the I2C descriptor using your shared physical pins (SDA=5, SCL=6)
+    // Uses I2C_NUM_0 and addresses the component via your board's 0x77 footprint identifier
+    ESP_ERROR_CHECK(dps310_init_desc(&dps_sensor_dev, DPS310_I2C_ADDRESS_1, I2C_NUM_0, 5, 6));
+
+    // 4. Construct the standard default sensor performance configurations
+    dps310_config_t dps_config;
+    memset(&dps_config, 0, sizeof(dps310_config_t));
+    
+    // 🛠️ THE EXACT INTERNAL MAPPING FIX: Match precision (prc) and naming macros exactly
+    dps_config.pm_rate = DPS310_PM_RATE_32;         // 32 Hz measurement frequency
+    dps_config.tmp_rate = DPS310_TMP_RATE_32;       // 32 Hz measurement frequency
+    dps_config.pm_oversampling = DPS310_PM_PRC_8;            // 8x oversampling precision
+    dps_config.tmp_oversampling = DPS310_TMP_PRC_8;          // 8x oversampling precision
+
+    // 5. Pass both the device structure pointer and our verified configuration layout
+    esp_err_t rc = dps310_init(&dps_sensor_dev, &dps_config);
+    if (rc != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize barometer hardware core; error=%d", rc);
+        return;
+    }
+
+    // Place the device into background measurement tracking mode natively
+    ESP_ERROR_CHECK(dps310_set_mode(&dps_sensor_dev, DPS310_MODE_BACKGROUND_ALL));
+
+    ESP_LOGI(TAG, "DPS310 Barometer Initialized Successfully!");
+}
+
+
 // 📦 GATT Access Callback Engine
 static int gatt_svr_chr_access_custom(uint16_t conn_handle, uint16_t attr_handle,
                                       struct ble_gatt_access_ctxt *ctxt, void *arg) {
@@ -267,7 +308,6 @@ static int ble_gap_event_handler(struct ble_gap_event *event, void *arg) {
     return 0;
 }
 
-// 📡 FIXED SPLIT-PACKET ADVERTISEMENT ROUTINE (Fits the 31-byte limit)
 void ble_app_advertise(void) {
     struct ble_gap_adv_params adv_params;
     struct ble_hs_adv_fields adv_fields;
@@ -276,17 +316,16 @@ void ble_app_advertise(void) {
     uint8_t own_addr_type;
     int rc;
 
-    rc = ble_hs_id_infer_auto(0, &own_addr_type);
+    // 🛠️ Fetch the newly generated random address profile token safely from the cache
+    rc = ble_hs_id_infer_auto(1, &own_addr_type); // "1" tells it to check for Random profiles
     if (rc != 0) {
-        ESP_LOGE(TAG, "Failed to infer address configuration type; rc=%d", rc);
+        ESP_LOGE(TAG, "Failed to infer dynamic address profile; rc=%d", rc);
         return;
     }
 
-    // --- PACKET 1: Main Advertisement Payload (Contains flags & custom UUID) ---
+    // --- PACKET 1: Main Advertisement Payload (Flags + Custom UUID) ---
     memset(&adv_fields, 0, sizeof(adv_fields));
     adv_fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
-    
-    // Inject the custom Service UUID your Swift app is looking for
     adv_fields.uuids128 = (ble_uuid128_t *)&custom_svc_uuid;
     adv_fields.num_uuids128 = 1;
     adv_fields.uuids128_is_complete = 1;
@@ -297,25 +336,25 @@ void ble_app_advertise(void) {
         return;
     }
 
-    // --- PACKET 2: Scan Response Payload (Contains the device name string) ---
+    // --- PACKET 2: Scan Response Payload (Custom Name String) ---
     memset(&rsp_fields, 0, sizeof(rsp_fields));
     device_name = ble_svc_gap_device_name();
     rsp_fields.name = (uint8_t *)device_name;
     rsp_fields.name_len = strlen(device_name);
     rsp_fields.name_is_complete = 1;
 
-    // Map the name data array to the secondary hardware scanning channel lanes
     rc = ble_gap_adv_rsp_set_fields(&rsp_fields);
     if (rc != 0) {
         ESP_LOGE(TAG, "Error setting scan response fields; rc=%d", rc);
         return;
     }
 
-    // Launch connection parameters
+    // Launch link parameters safely using our synchronized own_addr_type variable
     memset(&adv_params, 0, sizeof(adv_params));
     adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;
     adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
 
+    // 🚀 THE FIX: Passes the validated token through without breaking parameter constraints
     rc = ble_gap_adv_start(own_addr_type, NULL, BLE_HS_FOREVER,
                            &adv_params, ble_gap_event_handler, NULL);
     if (rc != 0) {
@@ -325,19 +364,31 @@ void ble_app_advertise(void) {
 
 
 
+
 void ble_app_on_sync(void) {
-    uint8_t own_addr_type; // Correctly matching primitive byte type configuration
+    // 🛠️ THE EXACT STRUCT FIX: Match the compiler's expected ble_addr_t type
+    ble_addr_t rnd_addr;    
+    uint8_t own_addr_type;
     
-    // Pass the memory pointer down to the auto-inference allocator engine
-    int rc = ble_hs_id_infer_auto(0, &own_addr_type);
+    // Generate a valid random static address into our struct
+    int rc = ble_hs_id_gen_rnd(0, &rnd_addr);
     if (rc != 0) {
-        ESP_LOGE(TAG, "Error determining address type; rc=%d", rc);
+        ESP_LOGE(TAG, "Failed to generate random BLE address; rc=%d", rc);
         return;
     }
     
-    // Begin broadcasting immediately upon driver stabilization
+    // Set this random address configuration to active memory registers using the inner value array
+    rc = ble_hs_id_set_rnd(rnd_addr.val);
+    assert(rc == 0);
+
+    // Auto-infer the system transmission parameter token (1 tells it to check for Random profiles)
+    rc = ble_hs_id_infer_auto(1, &own_addr_type);
+    assert(rc == 0);
+
+    // Launch the beacon radio channels safely
     ble_app_advertise();
 }
+
 
 
 void ble_host_task(void *param) {
