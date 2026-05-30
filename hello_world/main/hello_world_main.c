@@ -23,6 +23,12 @@
 #include <i2cdev.h>
 #include <dps310.h>
 
+// 🛠️ ADD THESE NETWORKING HEADERS FOR ESP-NOW SUPPORT
+#include "esp_netif.h"
+#include "esp_wifi.h"
+#include "esp_now.h"
+
+
 static const char *TAG = "OLED_BLE_App";
 
 #define LED_PIN_B 8
@@ -51,6 +57,21 @@ i2c_master_bus_handle_t bus_handle;
 // Shared global data buffers to pass values down into the GATT read pipelines
 char counter_string[32]; 
 
+// Storage locations for incoming remote board parameters
+static float remote_board_temp = 0.0f;
+static float remote_board_press = 0.0f;
+
+// 🛠️ MOVED TO GLOBAL SCOPE SO CALLBACKS CAN ACCESS THEM
+float height_change_inches = 0.0f;
+esp_lcd_panel_handle_t panel_handle = NULL;
+
+
+struct __attribute__((packed)) esp_now_payload_t {
+    float temp;
+    float press_hpa;
+};
+
+
 // 🎯 TRANSLATED ZEPHYR TO NIMBLE UUID CORES
 // Service: 00001523-1212-efde-1523-785feabcd123
 static const ble_uuid128_t custom_svc_uuid = {
@@ -68,6 +89,21 @@ static const ble_uuid128_t custom_chr_uuid = {
 
 // Global reference handle to push notifications down to the phone
 static uint16_t counter_chr_val_handle;
+
+// 🎯 20-BYTE FLOATING POINT MATRIX MATCH FOR DIRECT MAPPING
+struct __attribute__((packed)) sensor_payload_t {
+    float x;        // Accel X (Direct float context)
+    float y;        // Accel Y (Direct float context)
+    float z;        // Accel Z (Direct float context)
+    float press;    // Exact real-time pressure in hPa (e.g., 1018.78)
+    float temp;     // Exact real-time temperature (e.g., 22.94)
+};
+
+// Global instance to map parameters out to the GATT read table
+static struct sensor_payload_t tx_data;
+
+
+
 
 // Expanded 8x8 ASCII Monochrome Font Dictionary Array (Characters 32 to 122)
 static const uint8_t font8x8_basic[][8] = {
@@ -202,11 +238,13 @@ void draw_string(int x, int y, const char *str) {
 static int gatt_svr_chr_access_custom(uint16_t conn_handle, uint16_t attr_handle,
                                       struct ble_gatt_access_ctxt *ctxt, void *arg) {
     if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
-        int rc = os_mbuf_append(ctxt->om, counter_string, strlen(counter_string));
+        // 🛠️ FIX: Serves raw binary struct memory bytes instead of a text string
+        int rc = os_mbuf_append(ctxt->om, &tx_data, sizeof(tx_data));
         return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
     }
     return BLE_ATT_ERR_REQ_NOT_SUPPORTED;
 }
+
 
 // 🏢 GATT Service & Characteristic Definition Layout Matrix
 static const struct ble_gatt_svc_def gatt_svr_svcs[] = {
@@ -269,6 +307,10 @@ void ble_app_advertise(void) {
     uint8_t own_addr_type;
     int rc;
 
+    // 🛠️ STEP 1: FORCE INSTANT ATTRIBUTE OVERRIDE
+    // This fixes the boot synchronization race so it never defaults to "nimble"
+    ble_svc_gap_device_name_set("ESP32-C3-REF");
+
     rc = ble_hs_id_infer_auto(1, &own_addr_type); // Checks for Random profiles
     if (rc != 0) {
         ESP_LOGE(TAG, "Failed to infer dynamic address profile; rc=%d", rc);
@@ -290,6 +332,8 @@ void ble_app_advertise(void) {
 
     // --- PACKET 2: Scan Response Payload (Custom Name String) ---
     memset(&rsp_fields, 0, sizeof(rsp_fields));
+    
+    // Dynamically pulls the "ESP32C3-Altimeter" string we set above
     device_name = ble_svc_gap_device_name();
     rsp_fields.name = (uint8_t *)device_name;
     rsp_fields.name_len = strlen(device_name);
@@ -311,6 +355,7 @@ void ble_app_advertise(void) {
         ESP_LOGE(TAG, "Error starting advertisement operations; rc=%d", rc);
     }
 }
+
 
 void ble_app_on_sync(void) {
     ble_addr_t rnd_addr;    
@@ -387,8 +432,98 @@ void init_barometer(void) {
     ESP_LOGI(TAG, "DPS310 Barometer Initialized & Calibrated Successfully!");
 }
 
+void esp_now_recv_callback(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len) {
+    // 🎯 Reverted to direct global use: No more compilation error
+    if (len == sizeof(struct esp_now_payload_t)) {
+        struct esp_now_payload_t *incoming = (struct esp_now_payload_t *)data;
+        remote_board_temp = incoming->temp;
+        remote_board_press = incoming->press_hpa;
+
+        float m_temp = 0.0f, m_press = 0.0f, m_alt = 0.0f, m_calc_alt = 0.0f;
+        dps310_read_temp(&dps_sensor_dev, &m_temp);
+        dps310_read_pressure(&dps_sensor_dev, &m_press);
+        dps310_read_altitude(&dps_sensor_dev, &m_alt);
+        dps310_calc_altitude(&dps_sensor_dev, m_press, &m_calc_alt);
+
+        float m_press_hpa = m_press / 100.0f;
+        static float dual_board_baseline_offset = -999.0f;
+
+        float remote_calculated_altitude_meters = 0.0f;
+        dps310_calc_altitude(&dps_sensor_dev, remote_board_press * 100.0f, &remote_calculated_altitude_meters);
+        
+        float raw_height_inches = (m_calc_alt - remote_calculated_altitude_meters) * 39.3701f;
+
+        if (dual_board_baseline_offset == -999.0f) {
+            dual_board_baseline_offset = raw_height_inches;
+        }
+
+        height_change_inches = raw_height_inches - dual_board_baseline_offset;
+
+        if (fabsf(height_change_inches) < 1.5f) {
+            height_change_inches = 0.0f;
+        }
+
+        tx_data.x     = m_temp;
+        tx_data.y     = m_press_hpa;
+        tx_data.z     = remote_board_temp;
+        tx_data.press = remote_board_press;
+        tx_data.temp  = height_change_inches;
+
+        ESP_LOGI("SYNC_ALT", "M_Pres: %.2f | R_Pres: %.2f | Height: %.2f in", 
+                 m_press_hpa, remote_board_press, height_change_inches);
+
+        if (ble_connected) {
+            struct os_mbuf *om = ble_hs_mbuf_from_flat(&tx_data, sizeof(tx_data));
+            if (om != NULL) {
+                ble_gattc_notify_custom(conn_handle, counter_chr_val_handle, om);
+            }
+        }
+
+        char t_buf[32], p_buf[32], h_buf[32];
+        snprintf(t_buf, sizeof(t_buf), "TEMP: %.1f C", m_temp);
+        snprintf(p_buf, sizeof(p_buf), "PRES: %.1f hPa", m_press_hpa);
+        snprintf(h_buf, sizeof(h_buf), "HGHT: %.1f in", height_change_inches);
+
+        memset(frame_canvas, 0, sizeof(frame_canvas));
+        draw_string(0, 4, t_buf);
+        draw_string(0, 20, p_buf);
+        draw_string(0, 36, h_buf);
+
+        // 🎯 Use the global handle directly now
+        if (panel_handle != NULL) {
+            esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, 128, 64, frame_canvas);
+        }
+    }
+}
 
 
+
+
+void init_master_esp_now(void) {
+    // 1. Initialize the global network interface system layers
+    ESP_ERROR_CHECK(esp_netif_init());
+    
+    // 2. Load basic Wi-Fi structural configuration presets
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    
+    // 3. Force storage to local RAM instead of NVS to prevent read/write bottlenecks
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+    
+    // 4. Force Station Mode (STA) so the internal radio layout matches raw ESP-NOW parameters
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    
+    // 5. Spin up the physical radio antenna system layers
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    // 6. Initialize the core peer-to-peer ESP-NOW message transmission engines
+    ESP_ERROR_CHECK(esp_now_init());
+    
+    // 7. Attach your real-time data frame collector callback routing function
+    ESP_ERROR_CHECK(esp_now_register_recv_cb(esp_now_recv_callback));
+    
+    ESP_LOGI("RADIO_INIT", "ESP-NOW Subsystem Layer Bound Successfully!");
+}
 
 void app_main(void)
 {
@@ -400,25 +535,22 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    // --- 2. INITIALIZE THE DPS310 BAROMETER CORE FIRST ---
-    // This allows i2cdev to cleanly claim the single hardware Port 0 (SDA=5, SCL=6)
+    // --- 2. INITIALIZE RAM DATA STRUCTURE MEMORY FIELDS ---
+    // 🎯 Seeding buffers ensures early incoming packets do not process trash memory locations
+    memset(&tx_data, 0, sizeof(tx_data));
+    snprintf(counter_string, sizeof(counter_string), "T:0.0C P:0.0hPa H:0.0in");
+
+    // --- 3. INITIALIZE THE DPS310 BAROMETER SENSOR CORE ---
     init_barometer();
-    vTaskDelay(pdMS_TO_TICKS(100)); // Let the hardware settle
+    vTaskDelay(pdMS_TO_TICKS(100));
 
-    // 1. Correctly declare BOTH handles at the top of the block
+    // --- 4. INITIALIZE THE PHYSICAL OLED SCREEN PANEL ---
     esp_lcd_panel_io_handle_t io_handle = NULL;
-    esp_lcd_panel_handle_t panel_handle = NULL; // Fixed: No longer undeclared!
+    panel_handle = NULL; // Assign directly into your global tracker variable
 
-    // 2. Retrieve the thread-safe I2C handle using the official framework function
     i2c_master_bus_handle_t actual_bus_handle = NULL;
-    esp_err_t handle_err = i2cdev_get_shared_handle(I2C_NUM_0, (void **)&actual_bus_handle); // Fixed typo
+    ESP_ERROR_CHECK(i2cdev_get_shared_handle(I2C_NUM_0, (void **)&actual_bus_handle));
 
-    if (handle_err != ESP_OK || actual_bus_handle == NULL) {
-        ESP_LOGE("OLED_INIT", "Could not retrieve the shared i2cdev bus handle!");
-        return;
-    }
-
-    // 3. Your updated, modern bit-length panel IO configuration
     esp_lcd_panel_io_i2c_config_t io_config = {
         .dev_addr = 0x3C,               
         .scl_speed_hz = 400000,          
@@ -428,43 +560,41 @@ void app_main(void)
         .lcd_param_bits = 8,    
     };
 
-    // 4. Attach the OLED IO interface to the shared master bus handle
-    esp_err_t io_err = esp_lcd_new_panel_io_i2c(actual_bus_handle, &io_config, &io_handle);
-    if (io_err != ESP_OK) {
-        ESP_LOGE("OLED_INIT", "Failed to create I2C IO handle: %s", esp_err_to_name(io_err));
-        return; 
-    }
+    ESP_ERROR_CHECK(esp_lcd_new_panel_io_i2c(actual_bus_handle, &io_config, &io_handle));
 
-    // 5. Configure the physical SSD1306 display panel properties
     esp_lcd_panel_dev_config_t panel_config = {
-        .reset_gpio_num = -1, // Change to your reset physical pin number if you use one
+        .reset_gpio_num = -1, 
         .bits_per_pixel = 1,
     };
-
-    // 6. This will now compile cleanly on Line 421
     ESP_ERROR_CHECK(esp_lcd_new_panel_ssd1306(io_handle, &panel_config, &panel_handle));
 
-    
-    
     esp_lcd_panel_reset(panel_handle);
     esp_lcd_panel_init(panel_handle);
     esp_lcd_panel_set_gap(panel_handle, 0, 0); 
-    // esp_lcd_panel_mirror(panel_handle, true, false);
     esp_lcd_panel_disp_on_off(panel_handle, true);
 
-    // --- 3. INITIALIZE THE DPS310 SENSOR CONTROLLER ---
-    // Small delay allows physical I2C pins to settle between configurations
-    vTaskDelay(pdMS_TO_TICKS(100)); 
-    init_barometer();
+    // --- 5. INITIALIZE DIAGNOSTIC LED PIN ---
+    gpio_reset_pin(LED_PIN_B);
+    gpio_set_direction(LED_PIN_B, GPIO_MODE_OUTPUT);
+    int led_state = 0;
 
-    // --- 4. INITIALIZE BLE STACK SUBSYSTEM ---
+    // Clear frame buffer layout spaces natively
+    memset(frame_canvas, 0x00, sizeof(frame_canvas));
+    ESP_ERROR_CHECK(esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, 128, 64, frame_canvas));
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    // --- 6. INITIALIZE COEXISTENCE RADIO STEP A: WIRELESS ESP-NOW FIRST ---
+    // This safely reserves the underlying Wi-Fi MAC stacks before BLE spins up
+    init_master_esp_now();
+    vTaskDelay(pdMS_TO_TICKS(100)); // Allow internal radio allocation layers to settle
+
+    // --- 7. INITIALIZE COEXISTENCE RADIO STEP B: BLE STACK SUBSYSTEM ---
+    // NimBLE initializes safely last by gracefully sharing the pre-configured radio controller
     ret = nimble_port_init();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to initialize NimBLE stack; error=%d", ret);
         return;
     }
-
-    ble_svc_gap_device_name_set("ESP32C3-OLED");
     
     ble_gatts_reset();
     ble_svc_gap_init();
@@ -477,140 +607,18 @@ void app_main(void)
 
     ble_hs_cfg.sync_cb = ble_app_on_sync;
 
-    // Fire up background task execution thread lane
+    // Spawn background task thread layer to handle Bluetooth advertising callbacks
     xTaskCreate(ble_host_task, "ble_host_task", 4096, NULL, 5, NULL);
 
-    // --- 5. INITIALIZE DIAGNOSTIC LED PIN ---
-    gpio_reset_pin(LED_PIN_B);
-    gpio_set_direction(LED_PIN_B, GPIO_MODE_OUTPUT);
-    int led_state = 0;
+    ESP_LOGI(TAG, "Starting Master Heartbeat Thread Lane...");
 
-    int counter = 0;
-    char sensor_string[32];
-
-    // Initial silicon memory blackout sweep
-    memset(frame_canvas, 0x00, sizeof(frame_canvas));
-    esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, 127, 63, frame_canvas);
-    vTaskDelay(pdMS_TO_TICKS(100));
-
-    // --- 4. DATA READING & SCREEN DRAWING RUNTIME LOOP ---
-    float temperature = 0.0;
-    float pressure = 0.0;
-    float altitude = 0.0;
-    float calc_altitude = 0.0;
-    float pressure_hpa = 0.0; 
-
-    float baseline_altitude = -999.0f; 
-    float height_change_inches = 0.0f;
-
-    char oled_temp_buf[32];
-    char oled_press_buf[32];
-    char oled_height_buf[32]; 
-
-    ESP_LOGI(TAG, "Starting Sensor Polling & Display Loop...");
-
+    // --- 8. PRIMARY SYSTEM HEARTBEAT THREAD LANE ---
     while (1) {
-        // Fetch fresh values from the hardware registers
-        esp_err_t res_t = dps310_read_temp(&dps_sensor_dev, &temperature);
-        esp_err_t res_p = dps310_read_pressure(&dps_sensor_dev, &pressure);
-        esp_err_t res_a = dps310_read_altitude(&dps_sensor_dev, &altitude);
-        esp_err_t res_ca = dps310_calc_altitude(&dps_sensor_dev, pressure, &calc_altitude);
-
-        if (res_t == ESP_OK && res_p == ESP_OK && res_a == ESP_OK && res_ca == ESP_OK) {
-            pressure_hpa = pressure / 100.0f;
-
-            if (baseline_altitude == -999.0f) {
-                baseline_altitude = calc_altitude;
-            }
-
-            // Keep absolute boundaries active for relative desk height measurements
-            height_change_inches = fabsf(calc_altitude - baseline_altitude) * 39.3701f;
-
-            snprintf(counter_string, sizeof(counter_string), "T:%.1fC P:%.1fhPa", temperature, pressure_hpa);
-            
-            ESP_LOGI(TAG, "RAW TELEMETRY -> Temp: %.2f °C | Pressure: %.2f hPa | Altitude: %.2f | Calculated Altitude: %.2f | Height: %.2f in", 
-                     temperature, pressure_hpa, altitude, calc_altitude, height_change_inches);
-
-            snprintf(oled_temp_buf, sizeof(oled_temp_buf),     "TEMP: %.1f C", temperature);
-            snprintf(oled_press_buf, sizeof(oled_press_buf),   "PRES: %.1f hPa", pressure_hpa);
-            snprintf(oled_height_buf, sizeof(oled_height_buf), "HGHT: %.1f in", height_change_inches);
-
-            memset(frame_canvas, 0, sizeof(frame_canvas));
-            draw_string(0, 4, oled_temp_buf);
-            draw_string(0, 20, oled_press_buf);
-            draw_string(0, 36, oled_height_buf);
-            ESP_ERROR_CHECK(esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, 128, 64, frame_canvas));
-
-        } else {
-            ESP_LOGE(TAG, "I2C Error! Temp Code: %s | Press Code: %s", esp_err_to_name(res_t), esp_err_to_name(res_p));
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
-
-
-
-
-
-
-
-    /*
-    // --- 6. PRIMARY RUNTIME PROCESS LOOP ENGINE ---
-    while (1) {
-        // Toggle the onboard onboard LED to show the code is alive
+        // Toggle the physical status LED to verify that the microcontroller remains active
         gpio_set_level(LED_PIN_B, led_state);
         led_state = !led_state;
 
-        // Reset display memory layout matrix space to pure black
-        memset(frame_canvas, 0x00, sizeof(frame_canvas));
-
-        // Read data coordinates from the weather barometer
-        float temperature = 0.0f;
-        float pressure = 0.0f; 
-        bool ready = false;
-
-        // 🛠️ ALTERNATIVE 4-ARGUMENT SIGNATURE FIX (Only use if dps310_is_ready isn't found)
-        // Checks the MEAS_CFG register (0x08) using the sensor-ready flag bit mask (0x70)
-        if (dps310_is_ready_for(&dps_sensor_dev, 0x08, 0x70, &ready) == ESP_OK && ready) {
-            // 🛠️ THE COMPILER FIX: Use separate, explicit readout functions 
-            // This bypasses unexported header structures completely!
-            dps310_read_pressure(&dps_sensor_dev, &pressure);
-            dps310_read_temp(&dps_sensor_dev, &temperature);
-        }
-
-
-        // Draw application tag lines onto the buffer screen
-        draw_string(8, 0, "Esp32-c3");
-
-        // Format and render live temperature numbers
-        snprintf(sensor_string, sizeof(sensor_string), "Temp: %.1f C", temperature);
-        draw_string(4, 10, sensor_string);
-
-        // Format and render live pressure numbers (Converted to hPa)
-        snprintf(sensor_string, sizeof(sensor_string), "Pres: %.1f hPa", pressure / 100.0f);
-        draw_string(4, 20, sensor_string);
-
-        // Track wireless communication connection states
-        if (ble_connected) {
-            snprintf(counter_string, sizeof(counter_string), "Connected %d", counter++);
-            draw_string(4, 30, counter_string);
-            
-            // PUSH LIVE TELEMETRY PAYLOAD TO IPHONE APP
-            // We transmit the raw text data currently sitting inside counter_string
-            struct os_mbuf *om = ble_hs_mbuf_from_flat(counter_string, strlen(counter_string));
-            if (om != NULL) {
-                ble_gatts_notify_custom(conn_handle, counter_chr_val_handle, om);
-            }
-        } else {
-            snprintf(counter_string, sizeof(counter_string), "Beaconing %d", counter++);
-            draw_string(4, 30, counter_string);
-        }
-
-        // Push layout buffer modifications down to hardware channels
-        esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, 127, 63, frame_canvas);
-
-        // Frame cycle delay constraint (1 second interval)
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
-    */
 }
+
