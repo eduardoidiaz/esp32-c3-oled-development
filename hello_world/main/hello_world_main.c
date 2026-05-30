@@ -451,23 +451,29 @@ void esp_now_recv_callback(const esp_now_recv_info_t *recv_info, const uint8_t *
         float remote_calculated_altitude_meters = 0.0f;
         dps310_calc_altitude(&dps_sensor_dev, remote_board_press * 100.0f, &remote_calculated_altitude_meters);
         
-        float raw_height_inches = (m_calc_alt - remote_calculated_altitude_meters) * 39.3701f;
+        // 🛠️ CHANGED: Remove fabsf() and change subtraction order to (Remote - Master)
+        // This ensures the value goes POSITIVE when the slave is physically higher
+        float raw_height_inches = (remote_calculated_altitude_meters - m_calc_alt) * 39.3701f;
 
         if (dual_board_baseline_offset == -999.0f) {
-            dual_board_baseline_offset = raw_height_inches;
+            dual_board_baseline_offset = raw_height_inches; // Capture baseline desk discrepancy
         }
 
+        // Apply baseline calibration tare calibration
         height_change_inches = raw_height_inches - dual_board_baseline_offset;
 
+        // 🛠️ CHANGED: Update deadzone check to support signed positive/negative boundaries
         if (fabsf(height_change_inches) < 1.5f) {
             height_change_inches = 0.0f;
         }
 
+        // The assignment slots remain exactly the same
         tx_data.x     = m_temp;
         tx_data.y     = m_press_hpa;
         tx_data.z     = remote_board_temp;
         tx_data.press = remote_board_press;
-        tx_data.temp  = height_change_inches;
+        tx_data.temp  = height_change_inches; // Transmits signed inches directly to iPhone
+
 
         ESP_LOGI("SYNC_ALT", "M_Pres: %.2f | R_Pres: %.2f | Height: %.2f in", 
                  m_press_hpa, remote_board_press, height_change_inches);
