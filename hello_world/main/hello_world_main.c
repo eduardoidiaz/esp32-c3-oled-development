@@ -31,6 +31,11 @@ static const char *TAG = "OLED_BLE_App";
 #define SCREEN_WIDTH  81
 #define SCREEN_HEIGHT 40
 
+// 🛠️ FIXING THE DRIVER HEADER BUG EXPLICITLY:
+#undef DPS310_AVERAGE_SEA_LEVEL_PRESSURE_Pa
+#define DPS310_AVERAGE_SEA_LEVEL_PRESSURE_Pa (101325.0f) // True standard sea-level pressure in Pascals
+
+
 // 128 columns * 64 driver rows / 8 bits = 1024 total bytes allocated safely in RAM
 static uint8_t frame_canvas[1024]; 
 
@@ -339,36 +344,49 @@ void init_barometer(void) {
     // 2. Clear descriptions safely out of tracking RAM layout spaces
     memset(&dps_sensor_dev, 0, sizeof(dps310_t));
 
-    // 3. 🛠️ RESTORE THIS LINE: Target the single hardware I2C_NUM_0 on shared pins 5 and 6
+    // Initialize config macro to seed internal driver structures safely
+    dps310_config_t dps_config = DPS310_CONFIG_DEFAULT();
+    dps_config.tmp_oversampling = DPS310_PM_PRC_128; // Keep high for resolution
+    dps_config.pm_oversampling = DPS310_PM_PRC_128;
+    dps_config.tmp_rate = DPS310_TMP_RATE_1;
+    dps_config.pm_rate = DPS310_PM_RATE_64;
+    dps_config.tmp_src = 1; // Keep your fix to pull from the internal temperature diode
+
+    // 3. Initialize the physical pin connection mappings
     ESP_ERROR_CHECK(dps310_init_desc(&dps_sensor_dev, DPS310_I2C_ADDRESS_1, I2C_NUM_0, 5, 6));
 
-    // 👇 ADD THESE TWO LINES HERE TO ENABLE INTERNAL PULLUPS:
+    // Force internal software pullups active
     dps_sensor_dev.i2c_dev.cfg.sda_pullup_en = GPIO_PULLUP_ENABLE;
     dps_sensor_dev.i2c_dev.cfg.scl_pullup_en = GPIO_PULLUP_ENABLE;
 
-    // 4. Construct your standard default performance configurations
-    dps310_config_t dps_config;
-    memset(&dps_config, 0, sizeof(dps310_config_t));
-    
-    dps_config.pm_rate = DPS310_PM_RATE_32;         
-    dps_config.tmp_rate = DPS310_TMP_RATE_32;       
-    dps_config.pm_oversampling = DPS310_PM_PRC_8;  
-    dps_config.tmp_oversampling = DPS310_TMP_PRC_8; 
-    dps_config.tmp_src = 1;
-    ESP_LOGI(TAG, "dps_config.tmp_src = %d", dps_config.tmp_src);
+    // 4. Initialize device framework contexts
+    ESP_ERROR_CHECK(dps310_init(&dps_sensor_dev, &dps_config));
 
-    // 5. Pass device structural pointers into driver initialization logic
-    esp_err_t rc = dps310_init(&dps_sensor_dev, &dps_config);
-    if (rc != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize barometer hardware core; error=%d", rc);
-        return;
-    }
+    // 🛠️ NEW: Wait for the sensor and internal coefficients matrices to become ready on the bus
+    bool sensor_ready = false;
+    bool coef_ready = false;
+    do {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        if (!sensor_ready) {
+            dps310_is_ready_for_sensor(&dps_sensor_dev, &sensor_ready);
+        }
+        if (!coef_ready) {
+            dps310_is_ready_for_coef(&dps_sensor_dev, &coef_ready);
+        }
+    } while (!sensor_ready || !coef_ready);
 
-    // Place the device into background measurement tracking mode natively
-    ESP_ERROR_CHECK(dps310_set_mode(&dps_sensor_dev, DPS310_MODE_BACKGROUND_ALL));
+    // 🛠️ NEW: Extract and apply factory-fused internal calculation coefficients
+    ESP_ERROR_CHECK(dps310_get_coef(&dps_sensor_dev));
 
-    ESP_LOGI(TAG, "DPS310 Barometer Initialized Successfully!");
+    // 🛠️ NEW: Calibrate absolute altitude baseline lookup metrics to 18.288 meters
+    ESP_ERROR_CHECK(dps310_calibrate_altitude(&dps_sensor_dev, 18.288f));
+
+    // 🛠️ NEW: Spin up the background tracking pipeline engines using the proper API function
+    ESP_ERROR_CHECK(dps310_backgorund_start(&dps_sensor_dev, DPS310_MODE_BACKGROUND_ALL));
+
+    ESP_LOGI(TAG, "DPS310 Barometer Initialized & Calibrated Successfully!");
 }
+
 
 
 
@@ -475,14 +493,19 @@ void app_main(void)
     esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, 127, 63, frame_canvas);
     vTaskDelay(pdMS_TO_TICKS(100));
 
-        // --- 4. DATA READING & SCREEN DRAWING RUNTIME LOOP ---
+    // --- 4. DATA READING & SCREEN DRAWING RUNTIME LOOP ---
     float temperature = 0.0;
     float pressure = 0.0;
     float altitude = 0.0;
     float calc_altitude = 0.0;
-    float pressure_hpa = 0.0; // Added variable for hPa conversions
+    float pressure_hpa = 0.0; 
+
+    float baseline_altitude = -999.0f; 
+    float height_change_inches = 0.0f;
+
     char oled_temp_buf[32];
     char oled_press_buf[32];
+    char oled_height_buf[32]; 
 
     ESP_LOGI(TAG, "Starting Sensor Polling & Display Loop...");
 
@@ -494,38 +517,36 @@ void app_main(void)
         esp_err_t res_ca = dps310_calc_altitude(&dps_sensor_dev, pressure, &calc_altitude);
 
         if (res_t == ESP_OK && res_p == ESP_OK && res_a == ESP_OK && res_ca == ESP_OK) {
-            // Convert raw Pascals to hectopascals
             pressure_hpa = pressure / 100.0f;
 
-            // Update global string for BLE GATT reads using hPa
+            if (baseline_altitude == -999.0f) {
+                baseline_altitude = calc_altitude;
+            }
+
+            // Keep absolute boundaries active for relative desk height measurements
+            height_change_inches = fabsf(calc_altitude - baseline_altitude) * 39.3701f;
+
             snprintf(counter_string, sizeof(counter_string), "T:%.1fC P:%.1fhPa", temperature, pressure_hpa);
-            ESP_LOGI(TAG, "RAW TELEMETRY -> Temp: %.2f °C | Pressure: %.2f hPa | Altitude: %.f | Calulated Altitude: %.f", temperature, pressure_hpa, altitude, calc_altitude);
+            
+            ESP_LOGI(TAG, "RAW TELEMETRY -> Temp: %.2f °C | Pressure: %.2f hPa | Altitude: %.2f | Calculated Altitude: %.2f | Height: %.2f in", 
+                     temperature, pressure_hpa, altitude, calc_altitude, height_change_inches);
 
-            // Format strings cleanly for the physical layout metrics
-            snprintf(oled_temp_buf, sizeof(oled_temp_buf),   "TEMP: %.1f C", temperature);
-            snprintf(oled_press_buf, sizeof(oled_press_buf), "PRES: %.1f hPa", pressure_hpa); // Adjusted tag and decimals
+            snprintf(oled_temp_buf, sizeof(oled_temp_buf),     "TEMP: %.1f C", temperature);
+            snprintf(oled_press_buf, sizeof(oled_press_buf),   "PRES: %.1f hPa", pressure_hpa);
+            snprintf(oled_height_buf, sizeof(oled_height_buf), "HGHT: %.1f in", height_change_inches);
 
-            // 1. Clear the old RAM canvas buffer entirely (0x00 is off / blank)
             memset(frame_canvas, 0, sizeof(frame_canvas));
-
-            // 2. Draw the text strings onto the local virtual canvas arrays
-            // Line 1: x=0, y=8
-            draw_string(0, 8, oled_temp_buf);
-            // Line 2: x=0, y=24
-            draw_string(0, 24, oled_press_buf);
-
-            // 3. Flush the complete canvas directly to the screen via the panel handle
+            draw_string(0, 4, oled_temp_buf);
+            draw_string(0, 20, oled_press_buf);
+            draw_string(0, 36, oled_height_buf);
             ESP_ERROR_CHECK(esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, 128, 64, frame_canvas));
 
         } else {
-            ESP_LOGE(TAG, "I2C Error! Temp Code: %s | Press Code: %s", 
-                     esp_err_to_name(res_t), esp_err_to_name(res_p));
+            ESP_LOGE(TAG, "I2C Error! Temp Code: %s | Press Code: %s", esp_err_to_name(res_t), esp_err_to_name(res_p));
         }
 
-        // Refresh every 1 second
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
-
 
 
 
