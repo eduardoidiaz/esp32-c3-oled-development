@@ -433,12 +433,14 @@ void init_barometer(void) {
 }
 
 void esp_now_recv_callback(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len) {
-    // 🎯 Reverted to direct global use: No more compilation error
+    esp_lcd_panel_handle_t local_display = panel_handle; // Map global screen context safely
+
     if (len == sizeof(struct esp_now_payload_t)) {
         struct esp_now_payload_t *incoming = (struct esp_now_payload_t *)data;
         remote_board_temp = incoming->temp;
         remote_board_press = incoming->press_hpa;
 
+        // Fetch fresh Master metrics immediately when the packet arrives
         float m_temp = 0.0f, m_press = 0.0f, m_alt = 0.0f, m_calc_alt = 0.0f;
         dps310_read_temp(&dps_sensor_dev, &m_temp);
         dps310_read_pressure(&dps_sensor_dev, &m_press);
@@ -447,37 +449,47 @@ void esp_now_recv_callback(const esp_now_recv_info_t *recv_info, const uint8_t *
 
         float m_press_hpa = m_press / 100.0f;
         static float dual_board_baseline_offset = -999.0f;
+        
+        // 🛠️ LOW-PASS FILTER VARIABLES:
+        static float filtered_height_inches = 0.0f;
+        const float alpha = 0.15f; // 0.15 means 15% new data, 85% old smooth data
 
+        // Calculate the raw directional altitude delta (Remote - Master)
         float remote_calculated_altitude_meters = 0.0f;
         dps310_calc_altitude(&dps_sensor_dev, remote_board_press * 100.0f, &remote_calculated_altitude_meters);
         
-        // 🛠️ CHANGED: Remove fabsf() and change subtraction order to (Remote - Master)
-        // This ensures the value goes POSITIVE when the slave is physically higher
         float raw_height_inches = (remote_calculated_altitude_meters - m_calc_alt) * 39.3701f;
 
+        // Lock in your ground-zero calibration offset layout on the very first packet
         if (dual_board_baseline_offset == -999.0f) {
-            dual_board_baseline_offset = raw_height_inches; // Capture baseline desk discrepancy
+            dual_board_baseline_offset = raw_height_inches;
+            filtered_height_inches = 0.0f; // Seed the filter initial state
         }
 
         // Apply baseline calibration tare calibration
-        height_change_inches = raw_height_inches - dual_board_baseline_offset;
+        float clean_unfiltered_inches = raw_height_inches - dual_board_baseline_offset;
 
-        // 🛠️ CHANGED: Update deadzone check to support signed positive/negative boundaries
-        if (fabsf(height_change_inches) < 1.5f) {
+        // 🛠️ THE 1-LINE LOW-PASS EMA FILTER IMPLEMENTATION:
+        filtered_height_inches = (alpha * clean_unfiltered_inches) + ((1.0f - alpha) * filtered_height_inches);
+
+        // Apply a small signed noise deadzone to freeze absolute desk drift completely
+        if (fabsf(filtered_height_inches) < 1.0f) {
             height_change_inches = 0.0f;
+        } else {
+            height_change_inches = filtered_height_inches;
         }
 
-        // The assignment slots remain exactly the same
+        // Serialize the 5 floats for your iPhone App
         tx_data.x     = m_temp;
         tx_data.y     = m_press_hpa;
         tx_data.z     = remote_board_temp;
         tx_data.press = remote_board_press;
-        tx_data.temp  = height_change_inches; // Transmits signed inches directly to iPhone
+        tx_data.temp  = height_change_inches; // Passes beautifully filtered signed inches to Swift
 
-
-        ESP_LOGI("SYNC_ALT", "M_Pres: %.2f | R_Pres: %.2f | Height: %.2f in", 
+        ESP_LOGI("SYNC_ALT", "M_Pres: %.2f | R_Pres: %.2f | Filtered Height: %.2f in", 
                  m_press_hpa, remote_board_press, height_change_inches);
 
+        // Notify Phone App via BLE
         if (ble_connected) {
             struct os_mbuf *om = ble_hs_mbuf_from_flat(&tx_data, sizeof(tx_data));
             if (om != NULL) {
@@ -485,6 +497,7 @@ void esp_now_recv_callback(const esp_now_recv_info_t *recv_info, const uint8_t *
             }
         }
 
+        // Format and refresh your OLED display canvas text frames
         char t_buf[32], p_buf[32], h_buf[32];
         snprintf(t_buf, sizeof(t_buf), "TEMP: %.1f C", m_temp);
         snprintf(p_buf, sizeof(p_buf), "PRES: %.1f hPa", m_press_hpa);
@@ -495,13 +508,11 @@ void esp_now_recv_callback(const esp_now_recv_info_t *recv_info, const uint8_t *
         draw_string(0, 20, p_buf);
         draw_string(0, 36, h_buf);
 
-        // 🎯 Use the global handle directly now
-        if (panel_handle != NULL) {
-            esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, 128, 64, frame_canvas);
+        if (local_display != NULL) {
+            esp_lcd_panel_draw_bitmap(local_display, 0, 0, 128, 64, frame_canvas);
         }
     }
 }
-
 
 
 
