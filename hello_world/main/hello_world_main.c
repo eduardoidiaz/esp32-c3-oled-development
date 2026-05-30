@@ -90,13 +90,18 @@ static const ble_uuid128_t custom_chr_uuid = {
 // Global reference handle to push notifications down to the phone
 static uint16_t counter_chr_val_handle;
 
-// 🎯 20-BYTE FLOATING POINT MATRIX MATCH FOR DIRECT MAPPING
+// 🎯 REALIGNED DUAL-BOARD ACCURATE DATA MATRIX INTERFACE
 struct __attribute__((packed)) sensor_payload_t {
-    float x;        // Accel X (Direct float context)
-    float y;        // Accel Y (Direct float context)
-    float z;        // Accel Z (Direct float context)
-    float press;    // Exact real-time pressure in hPa (e.g., 1018.78)
-    float temp;     // Exact real-time temperature (e.g., 22.94)
+    float master_temp;    // [0..3 bytes]   Master Temperature (°C)
+    float master_press;   // [4..7 bytes]   Master Pressure (hPa)
+    float remote_temp;    // [8..11 bytes]  Remote Temperature (°C)
+    float remote_press;   // [12..15 bytes] Remote Pressure (hPa)
+    float height_delta;   // [16..19 bytes] Filtered Relative Height Change (Inches)
+    
+    // 🛠️ PLACEHOLDERS RESERVED FOR FUTURE ACCELEROMETER/SENSOR INTEGRATION:
+    float sensor_x;       // [20..23 bytes] Future Sensor Track X
+    float sensor_y;       // [24..27 bytes] Future Sensor Track Y
+    float sensor_z;       // [28..31 bytes] Future Sensor Track Z
 };
 
 // Global instance to map parameters out to the GATT read table
@@ -479,17 +484,22 @@ void esp_now_recv_callback(const esp_now_recv_info_t *recv_info, const uint8_t *
             height_change_inches = filtered_height_inches;
         }
 
-        // Serialize the 5 floats for your iPhone App
-        tx_data.x     = m_temp;
-        tx_data.y     = m_press_hpa;
-        tx_data.z     = remote_board_temp;
-        tx_data.press = remote_board_press;
-        tx_data.temp  = height_change_inches; // Passes beautifully filtered signed inches to Swift
+        // 🎯 DIRECT REALIGNED PACKET VALUE ASSIGNMENTS:
+        tx_data.master_temp  = m_temp;
+        tx_data.master_press = m_press_hpa;
+        tx_data.remote_temp  = remote_board_temp;
+        tx_data.remote_press = remote_board_press;
+        tx_data.height_delta = height_change_inches; // Passes your signed low-pass filtered inches
 
-        ESP_LOGI("SYNC_ALT", "M_Pres: %.2f | R_Pres: %.2f | Filtered Height: %.2f in", 
-                 m_press_hpa, remote_board_press, height_change_inches);
+        // 🛠️ SAFE RE-ROUTED HARDCODED SEED PLACEHOLDERS FOR FUTURE WORK:
+        tx_data.sensor_x     = 0.0f; 
+        tx_data.sensor_y     = 0.0f;
+        tx_data.sensor_z     = 0.0f;
 
-        // Notify Phone App via BLE
+        ESP_LOGI("SYNC_ALT","M_Temp: %.2f | M_Pres: %.2f | R_Temp: %.2f | R_Pres: %.2f | Filtered Height: %.2f in", 
+                m_temp , m_press_hpa, remote_board_temp, remote_board_press, height_change_inches);
+
+        // Broadcast raw binary frame down to phone via BLE
         if (ble_connected) {
             struct os_mbuf *om = ble_hs_mbuf_from_flat(&tx_data, sizeof(tx_data));
             if (om != NULL) {
