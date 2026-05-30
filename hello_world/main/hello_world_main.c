@@ -475,77 +475,58 @@ void app_main(void)
     esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, 127, 63, frame_canvas);
     vTaskDelay(pdMS_TO_TICKS(100));
 
-        // --- 4. DATA READING, LOW-PASS FILTER, & INCH ALTITUDE LOOP ---
+        // --- 4. DATA READING & SCREEN DRAWING RUNTIME LOOP ---
     float temperature = 0.0;
-    float pressure_pa = 0.0;
-    float current_hpa = 0.0;
-    
-    // Low-Pass Filter tracking variables
-    float filtered_hpa = -1.0f;
-    const float alpha = 0.05f; 
-
-    // Baseline and Altitude tracking variables
-    float baseline_hpa = -1.0f; 
-    float relative_delta_hpa = 0.0f;
-    float height_change_inches = 0.0f;
-
+    float pressure = 0.0;
+    float altitude = 0.0;
+    float calc_altitude = 0.0;
+    float pressure_hpa = 0.0; // Added variable for hPa conversions
     char oled_temp_buf[32];
     char oled_press_buf[32];
 
-    ESP_LOGI(TAG, "Starting Low-Pass Filtered Inch Altimeter Loop...");
+    ESP_LOGI(TAG, "Starting Sensor Polling & Display Loop...");
 
     while (1) {
+        // Fetch fresh values from the hardware registers
         esp_err_t res_t = dps310_read_temp(&dps_sensor_dev, &temperature);
-        esp_err_t res_p = dps310_read_pressure(&dps_sensor_dev, &pressure_pa);
+        esp_err_t res_p = dps310_read_pressure(&dps_sensor_dev, &pressure);
+        esp_err_t res_a = dps310_read_altitude(&dps_sensor_dev, &altitude);
+        esp_err_t res_ca = dps310_calc_altitude(&dps_sensor_dev, pressure, &calc_altitude);
 
-        if (res_t == ESP_OK && res_p == ESP_OK) {
-            current_hpa = pressure_pa / 100.0f;
+        if (res_t == ESP_OK && res_p == ESP_OK && res_a == ESP_OK && res_ca == ESP_OK) {
+            // Convert raw Pascals to hectopascals
+            pressure_hpa = pressure / 100.0f;
 
-            // Initialize the filter with the first raw reading on boot
-            if (filtered_hpa < 0.0f) {
-                filtered_hpa = current_hpa;
-                baseline_hpa = current_hpa;
-                ESP_LOGI(TAG, "🎯 Baseline & Filter Seeded: %.3f hPa", baseline_hpa);
-            }
+            // Update global string for BLE GATT reads using hPa
+            snprintf(counter_string, sizeof(counter_string), "T:%.1fC P:%.1fhPa", temperature, pressure_hpa);
+            ESP_LOGI(TAG, "RAW TELEMETRY -> Temp: %.2f °C | Pressure: %.2f hPa | Altitude: %.f | Calulated Altitude: %.f", temperature, pressure_hpa, altitude, calc_altitude);
 
-            // Apply the low-pass exponential filter
-            filtered_hpa = (alpha * current_hpa) + ((1.0f - alpha) * filtered_hpa);
-
-            // Calculate hPa difference from your baseline desk height
-            relative_delta_hpa = fabsf(filtered_hpa - baseline_hpa);
-
-            // 📐 CONVERT hPa TO INCHES:
-            // 1 hPa ≈ 329.1 feet at room temp. 329.1 feet * 12 inches = 3949.2 inches
-            height_change_inches = relative_delta_hpa * 3949.2f;
-
-            // Update your phone's BLE string buffer layout
-            snprintf(counter_string, sizeof(counter_string), "H: %.1f in", height_change_inches);
-            
-            // 🛠️ UPDATED WITH YOUR EXACT FORMAT PLUSSING ADDITIONAL INCH COLUMNS
-            ESP_LOGI(TAG, "RAW: %.3f | FILTERED: %.3f | Change: %.3f hPa | Height: %.2f in", 
-                     current_hpa, filtered_hpa, relative_delta_hpa, height_change_inches);
-
-            // Format strings for your physical screen layout matrix
+            // Format strings cleanly for the physical layout metrics
             snprintf(oled_temp_buf, sizeof(oled_temp_buf),   "TEMP: %.1f C", temperature);
-            snprintf(oled_press_buf, sizeof(oled_press_buf), "HGHT: %.1f in", height_change_inches);
+            snprintf(oled_press_buf, sizeof(oled_press_buf), "PRES: %.1f hPa", pressure_hpa); // Adjusted tag and decimals
 
-            // 1. Clear the old RAM canvas buffer entirely 
+            // 1. Clear the old RAM canvas buffer entirely (0x00 is off / blank)
             memset(frame_canvas, 0, sizeof(frame_canvas));
 
-            // 2. Render text onto the virtual matrix layout maps
+            // 2. Draw the text strings onto the local virtual canvas arrays
+            // Line 1: x=0, y=8
             draw_string(0, 8, oled_temp_buf);
+            // Line 2: x=0, y=24
             draw_string(0, 24, oled_press_buf);
 
-            // 3. Flush the tracking data matrix arrays to physical display pins
+            // 3. Flush the complete canvas directly to the screen via the panel handle
             ESP_ERROR_CHECK(esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, 128, 64, frame_canvas));
 
         } else {
-            ESP_LOGE(TAG, "I2C Error! Temp: %s | Press: %s", esp_err_to_name(res_t), esp_err_to_name(res_p));
+            ESP_LOGE(TAG, "I2C Error! Temp Code: %s | Press Code: %s", 
+                     esp_err_to_name(res_t), esp_err_to_name(res_p));
         }
 
-        // Poll every 1 second
+        // Refresh every 1 second
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
+
+
 
 
 
