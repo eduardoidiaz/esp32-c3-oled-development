@@ -319,6 +319,16 @@ static const struct ble_gatt_svc_def gatt_svr_svcs[] = {
     },
 };
 
+// 🎯 DYNAMIC RADIO REFRESH HELPER: Forcefully updates advertising data over-the-air
+static void ble_app_force_radio_refresh(void) {
+    // Stop the active hardware radio channel cleanly
+    ble_gap_adv_stop();
+    
+    // Re-invoke your advertising initializer to recalculate name packets natively
+    ble_app_advertise();
+    
+    ESP_LOGI("RADIO_REFRESH", "⚡ Hardware radio advertising payload refreshed dynamically.");
+}
 
 // 📡 BLE Event Management Callback Route
 static int ble_gap_event_handler(struct ble_gap_event *event, void *arg) {
@@ -332,7 +342,7 @@ static int ble_gap_event_handler(struct ble_gap_event *event, void *arg) {
                 // Actively demand a secure pairing handshake on connect
                 ble_gap_security_initiate(conn_handle);
 
-                // 🎯 START WATCHDOG: Give the user exactly 15 seconds to click "Pair"
+                // START WATCHDOG: Give the user exactly 15 seconds to click "Pair"
                 if (security_watchdog_timer == NULL) {
                     security_watchdog_timer = xTimerCreate("ble_sec_watchdog", pdMS_TO_TICKS(15000), 
                                                            pdFALSE, (void *)0, security_watchdog_callback);
@@ -350,17 +360,20 @@ static int ble_gap_event_handler(struct ble_gap_event *event, void *arg) {
             ESP_LOGI(TAG, "BLE Status: Connection Terminated!");
             ble_connected = false;
             
-            // 🎯 STOP WATCHDOG: Kill the timer if a disconnection happens naturally
+            // STOP WATCHDOG: Kill the timer if a disconnection happens naturally
             if (security_watchdog_timer != NULL) {
                 xTimerStop(security_watchdog_timer, 0);
             }
             
-            // 🎯 STOP GHOST TIMER: Connection dropped cleanly, no force-kill needed
+            // STOP GHOST TIMER: Connection dropped cleanly, no force-kill needed
             if (clear_ghost_link_timer != NULL) {
                 xTimerStop(clear_ghost_link_timer, 0);
             }
 
-            ble_app_advertise(); 
+            // 🎯 FIX: Force an instant over-the-air advertising refresh on every drop.
+            // If the name string changed to 'GreenCaddie-Reset' right before the drop,
+            // this enforces that the new name is instantly broadcasted to your Swift app!
+            ble_app_force_radio_refresh(); 
             break;
 
         case BLE_GAP_EVENT_ADV_COMPLETE:
@@ -371,17 +384,18 @@ static int ble_gap_event_handler(struct ble_gap_event *event, void *arg) {
         case BLE_GAP_EVENT_REPEAT_PAIRING:
             ESP_LOGW(TAG, "⚠️ Phone requested a repeat pairing! Keys are desynced.");
             
-            // 1. Fetch the descriptor to get the phone's MAC address
             struct ble_gap_conn_desc repeat_desc;
             if (ble_gap_conn_find(event->repeat_pairing.conn_handle, &repeat_desc) == 0) {
                 ESP_LOGW(TAG, "🧹 Purging old peer keys immediately to clear the deadlock...");
                 
-                // 2. Wipe the old keys out of the ESP32 NVS database
+                // Wipe the old keys out of the ESP32 NVS database
                 ble_gap_unpair(&repeat_desc.peer_id_addr);
             }
             
-            // 3. FIX: Break out instead of returning 0. This lets the core 
-            // NimBLE engine automatically proceed with key regeneration mid-stream.
+            // 🎯 FIX STEP 1: Shift the name string AND force an instant radio refresh!
+            // Because repeat pairing doesn't trigger a disconnection event, we must refresh the radio immediately.
+            ble_svc_gap_device_name_set("GreenCaddie-Reset");
+            ble_app_force_radio_refresh();
             break;
 
         case BLE_GAP_EVENT_ENC_CHANGE:
@@ -393,9 +407,9 @@ static int ble_gap_event_handler(struct ble_gap_event *event, void *arg) {
                     xTimerStop(security_watchdog_timer, 0);
                 }
                 
-                // 🎯 RECOVERY FIX: If the user manually pairs with the device after a reset event, 
+                // RECOVERY FIX: If the user manually pairs with the device after a reset event, 
                 // restore the retail device name string back to production defaults instantly.
-                ble_svc_gap_device_name_set("GreenCaddie-Ref");
+                ble_svc_gap_device_name_set("GreenCaddie-Anchor");
             } 
             // Status 5   = Authentication Failure (Often key mismatch)
             // Status 8   = Handshake Canceled (User clicked Cancel)
@@ -412,29 +426,23 @@ static int ble_gap_event_handler(struct ble_gap_event *event, void *arg) {
                     xTimerStop(security_watchdog_timer, 0);
                 }
 
-                // 🎯 AUTOMATIC BOND CLEANUP
-                // Look up the active connection info to grab the phone's MAC address
+                // AUTOMATIC BOND CLEANUP
                 struct ble_gap_conn_desc desc;
                 if (ble_gap_conn_find(event->enc_change.conn_handle, &desc) == 0) {
                     ESP_LOGW(TAG, "🧹 Key mismatch detected. Purging stale peer bond from flash memory...");
-                    
-                    // Unpair deletes this specific phone's old keys out of NVS storage
                     ble_gap_unpair(&desc.peer_id_addr);
                 }
                 
-                // 🎯 PRODUCTION WORKFLOW OVERRIDE LAYER
-                // Temporarily overwrite our broadcasting identity string to 'GreenCaddie-Reset'.
-                // This forcefully shatters the background auto-reconnect retrieval loop on the iOS side,
-                // driving the user back into your manual app list view selection posture!
+                // 🎯 FIX STEP 2: Assign the override name string.
+                // The actual radio advertisement payload rebuild will execute natively 
+                // inside the BLE_GAP_EVENT_DISCONNECT block right as the link severs!
                 ble_svc_gap_device_name_set("GreenCaddie-Reset");
-                ESP_LOGW("BRANDING", "🏷️ Shifted over-the-air signature profile to: GreenCaddie-Reset");
+                ESP_LOGW("BRANDING", "🏷️ Shifted name identity string to: GreenCaddie-Reset");
                 
                 // Attempt a graceful standard software disconnection drop
                 int rc = ble_gap_terminate(event->enc_change.conn_handle, BLE_ERR_REM_USER_CONN_TERM);
                 
                 if (rc == 0) {
-                    // Stack accepted termination; start 3-second backup ghost timer 
-                    // just in case the link physically freezes up.
                     ESP_LOGI("WATCHDOG", "⏳ Graceful disconnect sent. Arming ghost link backup safety timer.");
                     if (clear_ghost_link_timer == NULL) {
                         clear_ghost_link_timer = xTimerCreate("ghost_killer", pdMS_TO_TICKS(3000), 
@@ -444,8 +452,6 @@ static int ble_gap_event_handler(struct ble_gap_event *event, void *arg) {
                         xTimerStart(clear_ghost_link_timer, 0);
                     }
                 } else {
-                    // Connection is already dead or closing itself. 
-                    // Let BLE_GAP_EVENT_DISCONNECT handle it naturally.
                     ESP_LOGW(TAG, "Termination request skipped (rc=%d). Stack is already dropping connection.", rc);
                 }
             } 
@@ -459,6 +465,7 @@ static int ble_gap_event_handler(struct ble_gap_event *event, void *arg) {
     }
     return 0;
 }
+
 
 
 
