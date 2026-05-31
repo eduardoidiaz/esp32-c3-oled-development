@@ -28,6 +28,9 @@
 #include "esp_wifi.h"
 #include "esp_now.h"
 
+#include "freertos/timers.h" // Ensure the system timer headers are included
+
+static TimerHandle_t security_watchdog_timer = NULL;
 
 static const char *TAG = "OLED_BLE_App";
 
@@ -239,6 +242,21 @@ void draw_string(int x, int y, const char *str) {
     }
 }
 
+// 🎯 SECURITY WATCHDOG CALLBACK: Executes if the user ignores the pairing popup!
+void security_watchdog_callback(TimerHandle_t xTimer) {
+    if (ble_connected) {
+        struct ble_gap_conn_desc desc;
+        if (ble_gap_conn_find(conn_handle, &desc) == 0) {
+            // If the connection is STILL unencrypted after 15 seconds, kick them!
+            if (!desc.sec_state.encrypted) {
+                ESP_LOGE("WATCHDOG", "🛑 Pairing Prompt Timed Out! Forcefully disconnecting iPhone.");
+                ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+            }
+        }
+    }
+}
+
+
 // 📦 GATT Access Callback Engine
 static int gatt_svr_chr_access_custom(uint16_t conn_handle, uint16_t attr_handle,
                                       struct ble_gatt_access_ctxt *ctxt, void *arg) {
@@ -259,7 +277,11 @@ static const struct ble_gatt_svc_def gatt_svr_svcs[] = {
         .characteristics = (struct ble_gatt_chr_def[]) { {
             .uuid = &custom_chr_uuid.u, 
             .access_cb = gatt_svr_chr_access_custom,
-            .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY, 
+            
+            // 🎯 FIXED: Reverted to valid definitions. 
+            // In NimBLE, encryption on the link automatically protects the notify channel.
+            .flags = BLE_GATT_CHR_F_READ_ENC | BLE_GATT_CHR_F_NOTIFY, 
+                     
             .val_handle = &counter_chr_val_handle,
         }, {
             0, 
@@ -269,6 +291,10 @@ static const struct ble_gatt_svc_def gatt_svr_svcs[] = {
         0, 
     },
 };
+
+
+
+
 
 // Forward Declaration for BLE Advertising Trigger
 void ble_app_advertise(void);
@@ -281,20 +307,72 @@ static int ble_gap_event_handler(struct ble_gap_event *event, void *arg) {
             if (event->connect.status == 0) {
                 ble_connected = true;
                 conn_handle = event->connect.conn_handle;
+                
+                // Actively demand a secure pairing handshake on connect
+                ble_gap_security_initiate(conn_handle);
+
+                // 🎯 START WATCHDOG: Give the user exactly 15 seconds to click "Pair"
+                if (security_watchdog_timer == NULL) {
+                    security_watchdog_timer = xTimerCreate("ble_sec_watchdog", pdMS_TO_TICKS(15000), 
+                                                           pdFALSE, (void *)0, security_watchdog_callback);
+                }
+                if (security_watchdog_timer != NULL) {
+                    xTimerStart(security_watchdog_timer, 0);
+                    ESP_LOGI("WATCHDOG", "⏱️ 15-Second Pairing Watchdog Started.");
+                }
             } else {
                 ble_app_advertise();
             }
             break;
 
+
         case BLE_GAP_EVENT_DISCONNECT:
             ESP_LOGI(TAG, "BLE Status: Connection Terminated!");
             ble_connected = false;
+            
+            // 🎯 STOP WATCHDOG: Kill the timer if a disconnection happens naturally
+            if (security_watchdog_timer != NULL) {
+                xTimerStop(security_watchdog_timer, 0);
+            }
             ble_app_advertise(); 
             break;
 
         case BLE_GAP_EVENT_ADV_COMPLETE:
             ESP_LOGI(TAG, "Advertising complete; restarting...");
             ble_app_advertise();
+            break;
+
+        // 🎯 ADD THIS NEW CASE BLOCK TO HANDLE THE CANCELED PAIRING EVENT:
+        case BLE_GAP_EVENT_ENC_CHANGE:
+            ESP_LOGW("DIAGNOSTIC", "📢 RAW ENCRYPTION CHANGE STATUS CODE: %d", event->enc_change.status);
+            
+            if (event->enc_change.status == 0) {
+                // 🎯 SUCCESS: User clicked PAIR! Stop the watchdog timer immediately.
+                ESP_LOGI("WATCHDOG", "🔒 Handshake Success! Stopping Watchdog Timer.");
+                if (security_watchdog_timer != NULL) {
+                    xTimerStop(security_watchdog_timer, 0);
+                }
+            } 
+            // Status 5   = Authentication Failure
+            // Status 8   = Handshake Canceled (User clicked Cancel)
+            // Status 16  = Handshake Timeout (User ignored the popup until it timed out)
+            // Status 1288 = User actively clicked Cancel on the iOS Pairing Popup
+            else if (event->enc_change.status == 5 || 
+                     event->enc_change.status == 8 || 
+                     event->enc_change.status == 16 ||
+                     event->enc_change.status == 1288) {
+                
+                ESP_LOGW(TAG, "❌ Pairing refused/failed (Status %d). Kicking client!", event->enc_change.status);
+                if (security_watchdog_timer != NULL) {
+                    xTimerStop(security_watchdog_timer, 0);
+                }
+                ble_gap_terminate(event->enc_change.conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+            } 
+            // Status 13 = iOS background app minimize state.
+            // We ignore this to keep background data streaming alive smoothly.
+            else if (event->enc_change.status == 13) {
+                ESP_LOGI(TAG, "📱 iOS App transitioned to background. Keeping data pipeline active.");
+            }
             break;
 
         default:
@@ -499,13 +577,25 @@ void esp_now_recv_callback(const esp_now_recv_info_t *recv_info, const uint8_t *
         ESP_LOGI("SYNC_ALT","M_Temp: %.2f | M_Pres: %.2f | R_Temp: %.2f | R_Pres: %.2f | Filtered Height: %.2f in", 
                 m_temp , m_press_hpa, remote_board_temp, remote_board_press, height_change_inches);
 
-        // Broadcast raw binary frame down to phone via BLE
+        // 🛠️ ACTIVE SECURITY LOCK:
+        // Check the encryption state of the connection before pushing data frames
         if (ble_connected) {
-            struct os_mbuf *om = ble_hs_mbuf_from_flat(&tx_data, sizeof(tx_data));
-            if (om != NULL) {
-                ble_gattc_notify_custom(conn_handle, counter_chr_val_handle, om);
+            struct ble_gap_conn_desc desc;
+            
+            // Look up the active connection status via its handle
+            if (ble_gap_conn_find(conn_handle, &desc) == 0) {
+                // 🎯 CRITICAL: Check if the connection has completed its encryption handshake!
+                if (desc.sec_state.encrypted) {
+                    struct os_mbuf *om = ble_hs_mbuf_from_flat(&tx_data, sizeof(tx_data));
+                    if (om != NULL) {
+                        ble_gattc_notify_custom(conn_handle, counter_chr_val_handle, om);
+                    }
+                } else {
+                    ESP_LOGW("SECURITY_GUARD", "⚠️ Connection alive but unencrypted. Data blocked!");
+                }
             }
         }
+
 
         // Format and refresh your OLED display canvas text frames
         char t_buf[32], p_buf[32], h_buf[32];
@@ -626,6 +716,13 @@ void app_main(void)
     ble_gatts_reset();
     ble_svc_gap_init();
     ble_svc_gatt_init();
+
+    // 🎯 FIX Step 1: ENABLE SECURITY AND BONDING FOR AUTO-SAVING
+    ble_hs_cfg.sm_io_cap = BLE_SM_IO_CAP_NO_IO; // No keyboard/display on ESP32
+    ble_hs_cfg.sm_bonding = 1;                  // 1 = Enable Bonding (Saves the device!)
+    ble_hs_cfg.sm_mitm = 0;                     // Man-in-the-middle protection not required
+    ble_hs_cfg.sm_sc = 1;                       // Enable Secure Connections (LE Secure Connections)
+
     
     int rc = ble_gatts_count_cfg(gatt_svr_svcs);
     assert(rc == 0);
