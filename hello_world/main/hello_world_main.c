@@ -384,7 +384,6 @@ static int ble_gap_event_handler(struct ble_gap_event *event, void *arg) {
             // NimBLE engine automatically proceed with key regeneration mid-stream.
             break;
 
-
         case BLE_GAP_EVENT_ENC_CHANGE:
             ESP_LOGW("DIAGNOSTIC", "📢 RAW ENCRYPTION CHANGE STATUS CODE: %d", event->enc_change.status);
             
@@ -393,6 +392,10 @@ static int ble_gap_event_handler(struct ble_gap_event *event, void *arg) {
                 if (security_watchdog_timer != NULL) {
                     xTimerStop(security_watchdog_timer, 0);
                 }
+                
+                // 🎯 RECOVERY FIX: If the user manually pairs with the device after a reset event, 
+                // restore the retail device name string back to production defaults instantly.
+                ble_svc_gap_device_name_set("GreenCaddie-Ref");
             } 
             // Status 5   = Authentication Failure (Often key mismatch)
             // Status 8   = Handshake Canceled (User clicked Cancel)
@@ -419,6 +422,13 @@ static int ble_gap_event_handler(struct ble_gap_event *event, void *arg) {
                     ble_gap_unpair(&desc.peer_id_addr);
                 }
                 
+                // 🎯 PRODUCTION WORKFLOW OVERRIDE LAYER
+                // Temporarily overwrite our broadcasting identity string to 'GreenCaddie-Reset'.
+                // This forcefully shatters the background auto-reconnect retrieval loop on the iOS side,
+                // driving the user back into your manual app list view selection posture!
+                ble_svc_gap_device_name_set("GreenCaddie-Reset");
+                ESP_LOGW("BRANDING", "🏷️ Shifted over-the-air signature profile to: GreenCaddie-Reset");
+                
                 // Attempt a graceful standard software disconnection drop
                 int rc = ble_gap_terminate(event->enc_change.conn_handle, BLE_ERR_REM_USER_CONN_TERM);
                 
@@ -435,7 +445,7 @@ static int ble_gap_event_handler(struct ble_gap_event *event, void *arg) {
                     }
                 } else {
                     // Connection is already dead or closing itself. 
-                    // No ghost timer is needed; let BLE_GAP_EVENT_DISCONNECT handle it naturally.
+                    // Let BLE_GAP_EVENT_DISCONNECT handle it naturally.
                     ESP_LOGW(TAG, "Termination request skipped (rc=%d). Stack is already dropping connection.", rc);
                 }
             } 
@@ -451,6 +461,7 @@ static int ble_gap_event_handler(struct ble_gap_event *event, void *arg) {
 }
 
 
+
 // 📡 SPLIT-PACKET ADVERTISEMENT ROUTINE (Fits the 31-byte limit)
 void ble_app_advertise(void) {
     struct ble_gap_adv_params adv_params;
@@ -460,9 +471,9 @@ void ble_app_advertise(void) {
     uint8_t own_addr_type;
     int rc;
 
-    // 🛠️ STEP 1: FORCE INSTANT ATTRIBUTE OVERRIDE
-    // This fixes the boot synchronization race so it never defaults to "nimble"
-    ble_svc_gap_device_name_set("ESP32-C3-REF");
+    // 🛠️ STEP 1: FORCE PRODUCTION BRANDING OVERRIDE
+    // Keep it concise to ensure Packet 2 (Scan Response) fits the 31-byte limit.
+    ble_svc_gap_device_name_set("GreenCaddie-Anchor");
 
     rc = ble_hs_id_infer_auto(1, &own_addr_type); // Checks for Random profiles
     if (rc != 0) {
