@@ -19,6 +19,9 @@
 #include "nvs_flash.h"
 #include "services/gatt/ble_svc_gatt.h"
 #include "store/config/ble_store_config.h"
+#include "host/ble_store.h"
+#include "host/ble_hs_pvcy.h"  // 🎯 ADD THIS LINE
+
 
 
 // Barometer Driver Includes
@@ -483,7 +486,7 @@ void ble_app_advertise(void) {
     // --- PACKET 2: Scan Response Payload (Custom Name String) ---
     memset(&rsp_fields, 0, sizeof(rsp_fields));
     
-    // Dynamically pulls the "ESP32C3-Altimeter" string we set above
+    // Dynamically pulls the "ESP32-C3-REF" string we set above
     device_name = ble_svc_gap_device_name();
     rsp_fields.name = (uint8_t *)device_name;
     rsp_fields.name_len = strlen(device_name);
@@ -506,18 +509,44 @@ void ble_app_advertise(void) {
     }
 }
 
-
 void ble_app_on_sync(void) {
-    ble_addr_t rnd_addr;    
     uint8_t own_addr_type;
-    
-    int rc = ble_hs_id_gen_rnd(0, &rnd_addr);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "Failed to generate random BLE address; rc=%d", rc);
+    ble_addr_t rnd_addr;
+    nvs_handle_t my_nvs_handle;
+    esp_err_t err;
+    size_t address_size = sizeof(rnd_addr.val);
+
+    // 🎯 THE FINAL ALIGNMENT FIX: Explicitly open the exact "nimble_bond" namespace!
+    // This groups your identity MAC seed directly inside the stack's native pairing table.
+    err = nvs_open("nimble_bond", NVS_READWRITE, &my_nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open nimble_bond partition table! err=%d", err);
         return;
     }
-    
-    rc = ble_hs_id_set_rnd(rnd_addr.val);
+
+    // Try to read an existing permanent MAC address seed out of flash
+    err = nvs_get_blob(my_nvs_handle, "ble_mac_seed", rnd_addr.val, &address_size);
+
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW(TAG, "💾 No saved BLE identity found in NVS. Generating a permanent identity...");
+        int rc = ble_hs_id_gen_rnd(0, &rnd_addr);
+        if (rc != 0) {
+            ESP_LOGE(TAG, "Failed to generate random BLE address; rc=%d", rc);
+            nvs_close(my_nvs_handle);
+            return;
+        }
+
+        err = nvs_set_blob(my_nvs_handle, "ble_mac_seed", rnd_addr.val, sizeof(rnd_addr.val));
+        if (err == ESP_OK) {
+            nvs_commit(my_nvs_handle);
+            ESP_LOGI(TAG, "✨ Permanent BLE identity securely locked into nimble_bond flash!");
+        }
+    } else if (err == ESP_OK) {
+        ESP_LOGI(TAG, "✅ Loaded existing permanent BLE identity from nimble_bond partition.");
+    }
+    nvs_close(my_nvs_handle);
+
+    int rc = ble_hs_id_set_rnd(rnd_addr.val);
     assert(rc == 0);
 
     rc = ble_hs_id_infer_auto(1, &own_addr_type);
@@ -525,6 +554,8 @@ void ble_app_on_sync(void) {
 
     ble_app_advertise();
 }
+
+
 
 void ble_host_task(void *param) {
     ESP_LOGI(TAG, "NimBLE Host Thread Initialized.");
@@ -772,8 +803,7 @@ void app_main(void)
     init_master_esp_now();
     vTaskDelay(pdMS_TO_TICKS(100)); // Allow internal radio allocation layers to settle
 
-    // --- 7. INITIALIZE COEXISTENCE RADIO STEP B: BLE STACK SUBSYSTEM ---
-    // NimBLE initializes safely last by gracefully sharing the pre-configured radio controller
+        // --- 7. INITIALIZE COEXISTENCE RADIO STEP B: BLE STACK SUBSYSTEM ---
     ret = nimble_port_init();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to initialize NimBLE stack; error=%d", ret);
@@ -784,32 +814,32 @@ void app_main(void)
     ble_svc_gap_init();
     ble_svc_gatt_init();
 
-    // 🎯 FIX STEP 1: ENABLE SECURITY AND BONDING FOR AUTO-SAVING
-    ble_hs_cfg.sm_io_cap = BLE_SM_IO_CAP_NO_IO; // No keyboard/display on ESP32
+    // ENABLE SECURITY AND BONDING FOR AUTO-SAVING
+    ble_hs_cfg.sm_io_cap = BLE_SM_IO_CAP_NO_IO; // Keep your display configuration choice
     ble_hs_cfg.sm_bonding = 1;                  // 1 = Enable Bonding (Saves the device!)
-    ble_hs_cfg.sm_mitm = 0;                     // Man-in-the-middle protection not required
+    ble_hs_cfg.sm_mitm = 0;                     // MITM protection not required for this link
     ble_hs_cfg.sm_sc = 1;                       // Enable Secure Connections (LE Secure Connections)
 
-    // 🎯 ADD THIS CONFIGURATION PROPERTY:
-    // This gives NimBLE permission to overwrite old flash entries on a repeat pairing event
-    // 🎯 FIX: Use the standard NimBLE key distribution macros and members
-    ble_hs_cfg.sm_our_key_dist |= BLE_HS_KEY_DIST_ENC_KEY;
+    // 🎯 FIX: Map the encryption and identity keys to the correct structural members
+    // This tells the stack to distribute and save both the LTK and the IRK privacy keys!
+    ble_hs_cfg.sm_our_key_dist |= (BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID);
+    ble_hs_cfg.sm_their_key_dist |= (BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID);
 
-    // 🎯 FIX STEP 2: REGISTER STORAGE HANDLERS
-    // This tells NimBLE to map security bonds to the built-in NVS storage backend
-    ble_store_config_init();
-
-    // 🎯 FIX STEP 3: DEVELOPMENT MASTER RESET (OPTIONAL)
-    // Comment these out once your pairing flow is entirely stable!
-    // ble_store_clear_all(BLE_STORE_OBJ_TYPE_OUR_SEC, BLE_STORE_OBJ_ID_ANY);
-    // ble_store_clear_all(BLE_STORE_OBJ_TYPE_PEER_SEC, BLE_STORE_OBJ_ID_ANY);
-    // ESP_LOGW(TAG, "♻️ Development Mode: Cleared all old phone bonds from flash storage.");
-
+   // Populate service configuration limits
     int rc = ble_gatts_count_cfg(gatt_svr_svcs);
     assert(rc == 0);
     rc = ble_gatts_add_svcs(gatt_svr_svcs);
     assert(rc == 0);
 
+    // 🎯 CRITICAL FIX: Bind callbacks and register the storage config handlers 
+    // immediately AFTER adding your services, but BEFORE launching the host task loop.
+    ble_hs_cfg.store_read_cb = ble_store_config_read;
+    ble_hs_cfg.store_write_cb = ble_store_config_write;
+    
+    // Maps the internal security bonds backend directly to the "nvs" partition
+    ble_store_config_init();
+
+    // Bind sync callback
     ble_hs_cfg.sync_cb = ble_app_on_sync;
 
     // Spawn background task thread layer to handle Bluetooth advertising callbacks
