@@ -18,6 +18,8 @@
 #include "services/gap/ble_svc_gap.h"
 #include "nvs_flash.h"
 #include "services/gatt/ble_svc_gatt.h"
+#include "store/config/ble_store_config.h"
+
 
 // Barometer Driver Includes
 #include <i2cdev.h>
@@ -31,6 +33,8 @@
 #include "freertos/timers.h" // Ensure the system timer headers are included
 
 static TimerHandle_t security_watchdog_timer = NULL;
+
+static TimerHandle_t clear_ghost_link_timer = NULL;
 
 static const char *TAG = "OLED_BLE_App";
 
@@ -242,6 +246,10 @@ void draw_string(int x, int y, const char *str) {
     }
 }
 
+void ble_store_config_init(void);
+// Forward Declaration for BLE Advertising Trigger
+void ble_app_advertise(void);
+
 // 🎯 SECURITY WATCHDOG CALLBACK: Executes if the user ignores the pairing popup!
 void security_watchdog_callback(TimerHandle_t xTimer) {
     if (ble_connected) {
@@ -255,6 +263,22 @@ void security_watchdog_callback(TimerHandle_t xTimer) {
         }
     }
 }
+
+// 🎯 FORCE-KILL CALLBACK: Executes only if a ghost link physically freezes
+void force_kill_ghost_link_callback(TimerHandle_t xTimer) {
+    // If BLE_GAP_EVENT_DISCONNECT has not fired after 3 full seconds, the stack is stuck
+    if (ble_connected) {
+        ESP_LOGE("GHOST_RESET", "🚨 CRITICAL: Link frozen after 3 seconds! Forcing low-level stack disconnect.");
+        
+        // Use standard termination code to clear the stalled handle
+        ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        
+        // NOTE: If your stack remains completely locked up here, you can 
+        // fall back to a total system reboot via: esp_restart();
+    }
+}
+
+
 
 
 // 📦 GATT Access Callback Engine
@@ -293,12 +317,6 @@ static const struct ble_gatt_svc_def gatt_svr_svcs[] = {
 };
 
 
-
-
-
-// Forward Declaration for BLE Advertising Trigger
-void ble_app_advertise(void);
-
 // 📡 BLE Event Management Callback Route
 static int ble_gap_event_handler(struct ble_gap_event *event, void *arg) {
     switch (event->type) {
@@ -325,7 +343,6 @@ static int ble_gap_event_handler(struct ble_gap_event *event, void *arg) {
             }
             break;
 
-
         case BLE_GAP_EVENT_DISCONNECT:
             ESP_LOGI(TAG, "BLE Status: Connection Terminated!");
             ble_connected = false;
@@ -334,6 +351,12 @@ static int ble_gap_event_handler(struct ble_gap_event *event, void *arg) {
             if (security_watchdog_timer != NULL) {
                 xTimerStop(security_watchdog_timer, 0);
             }
+            
+            // 🎯 STOP GHOST TIMER: Connection dropped cleanly, no force-kill needed
+            if (clear_ghost_link_timer != NULL) {
+                xTimerStop(clear_ghost_link_timer, 0);
+            }
+
             ble_app_advertise(); 
             break;
 
@@ -342,18 +365,33 @@ static int ble_gap_event_handler(struct ble_gap_event *event, void *arg) {
             ble_app_advertise();
             break;
 
-        // 🎯 ADD THIS NEW CASE BLOCK TO HANDLE THE CANCELED PAIRING EVENT:
+        case BLE_GAP_EVENT_REPEAT_PAIRING:
+            ESP_LOGW(TAG, "⚠️ Phone requested a repeat pairing! Keys are desynced.");
+            
+            // 1. Fetch the descriptor to get the phone's MAC address
+            struct ble_gap_conn_desc repeat_desc;
+            if (ble_gap_conn_find(event->repeat_pairing.conn_handle, &repeat_desc) == 0) {
+                ESP_LOGW(TAG, "🧹 Purging old peer keys immediately to clear the deadlock...");
+                
+                // 2. Wipe the old keys out of the ESP32 NVS database
+                ble_gap_unpair(&repeat_desc.peer_id_addr);
+            }
+            
+            // 3. FIX: Break out instead of returning 0. This lets the core 
+            // NimBLE engine automatically proceed with key regeneration mid-stream.
+            break;
+
+
         case BLE_GAP_EVENT_ENC_CHANGE:
             ESP_LOGW("DIAGNOSTIC", "📢 RAW ENCRYPTION CHANGE STATUS CODE: %d", event->enc_change.status);
             
             if (event->enc_change.status == 0) {
-                // 🎯 SUCCESS: User clicked PAIR! Stop the watchdog timer immediately.
                 ESP_LOGI("WATCHDOG", "🔒 Handshake Success! Stopping Watchdog Timer.");
                 if (security_watchdog_timer != NULL) {
                     xTimerStop(security_watchdog_timer, 0);
                 }
             } 
-            // Status 5   = Authentication Failure
+            // Status 5   = Authentication Failure (Often key mismatch)
             // Status 8   = Handshake Canceled (User clicked Cancel)
             // Status 16  = Handshake Timeout (User ignored the popup until it timed out)
             // Status 1288 = User actively clicked Cancel on the iOS Pairing Popup
@@ -362,14 +400,42 @@ static int ble_gap_event_handler(struct ble_gap_event *event, void *arg) {
                      event->enc_change.status == 16 ||
                      event->enc_change.status == 1288) {
                 
-                ESP_LOGW(TAG, "❌ Pairing refused/failed (Status %d). Kicking client!", event->enc_change.status);
+                ESP_LOGW(TAG, "❌ Security dropped/refused (Status %d). Launching shutdown process.", event->enc_change.status);
+                
                 if (security_watchdog_timer != NULL) {
                     xTimerStop(security_watchdog_timer, 0);
                 }
-                ble_gap_terminate(event->enc_change.conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+
+                // 🎯 AUTOMATIC BOND CLEANUP
+                // Look up the active connection info to grab the phone's MAC address
+                struct ble_gap_conn_desc desc;
+                if (ble_gap_conn_find(event->enc_change.conn_handle, &desc) == 0) {
+                    ESP_LOGW(TAG, "🧹 Key mismatch detected. Purging stale peer bond from flash memory...");
+                    
+                    // Unpair deletes this specific phone's old keys out of NVS storage
+                    ble_gap_unpair(&desc.peer_id_addr);
+                }
+                
+                // Attempt a graceful standard software disconnection drop
+                int rc = ble_gap_terminate(event->enc_change.conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+                
+                if (rc == 0) {
+                    // Stack accepted termination; start 3-second backup ghost timer 
+                    // just in case the link physically freezes up.
+                    ESP_LOGI("WATCHDOG", "⏳ Graceful disconnect sent. Arming ghost link backup safety timer.");
+                    if (clear_ghost_link_timer == NULL) {
+                        clear_ghost_link_timer = xTimerCreate("ghost_killer", pdMS_TO_TICKS(3000), 
+                                                              pdFALSE, (void *)0, force_kill_ghost_link_callback);
+                    }
+                    if (clear_ghost_link_timer != NULL) {
+                        xTimerStart(clear_ghost_link_timer, 0);
+                    }
+                } else {
+                    // Connection is already dead or closing itself. 
+                    // No ghost timer is needed; let BLE_GAP_EVENT_DISCONNECT handle it naturally.
+                    ESP_LOGW(TAG, "Termination request skipped (rc=%d). Stack is already dropping connection.", rc);
+                }
             } 
-            // Status 13 = iOS background app minimize state.
-            // We ignore this to keep background data streaming alive smoothly.
             else if (event->enc_change.status == 13) {
                 ESP_LOGI(TAG, "📱 iOS App transitioned to background. Keeping data pipeline active.");
             }
@@ -380,6 +446,7 @@ static int ble_gap_event_handler(struct ble_gap_event *event, void *arg) {
     }
     return 0;
 }
+
 
 // 📡 SPLIT-PACKET ADVERTISEMENT ROUTINE (Fits the 31-byte limit)
 void ble_app_advertise(void) {
@@ -717,13 +784,27 @@ void app_main(void)
     ble_svc_gap_init();
     ble_svc_gatt_init();
 
-    // 🎯 FIX Step 1: ENABLE SECURITY AND BONDING FOR AUTO-SAVING
+    // 🎯 FIX STEP 1: ENABLE SECURITY AND BONDING FOR AUTO-SAVING
     ble_hs_cfg.sm_io_cap = BLE_SM_IO_CAP_NO_IO; // No keyboard/display on ESP32
     ble_hs_cfg.sm_bonding = 1;                  // 1 = Enable Bonding (Saves the device!)
     ble_hs_cfg.sm_mitm = 0;                     // Man-in-the-middle protection not required
     ble_hs_cfg.sm_sc = 1;                       // Enable Secure Connections (LE Secure Connections)
 
-    
+    // 🎯 ADD THIS CONFIGURATION PROPERTY:
+    // This gives NimBLE permission to overwrite old flash entries on a repeat pairing event
+    // 🎯 FIX: Use the standard NimBLE key distribution macros and members
+    ble_hs_cfg.sm_our_key_dist |= BLE_HS_KEY_DIST_ENC_KEY;
+
+    // 🎯 FIX STEP 2: REGISTER STORAGE HANDLERS
+    // This tells NimBLE to map security bonds to the built-in NVS storage backend
+    ble_store_config_init();
+
+    // 🎯 FIX STEP 3: DEVELOPMENT MASTER RESET (OPTIONAL)
+    // Comment these out once your pairing flow is entirely stable!
+    // ble_store_clear_all(BLE_STORE_OBJ_TYPE_OUR_SEC, BLE_STORE_OBJ_ID_ANY);
+    // ble_store_clear_all(BLE_STORE_OBJ_TYPE_PEER_SEC, BLE_STORE_OBJ_ID_ANY);
+    // ESP_LOGW(TAG, "♻️ Development Mode: Cleared all old phone bonds from flash storage.");
+
     int rc = ble_gatts_count_cfg(gatt_svr_svcs);
     assert(rc == 0);
     rc = ble_gatts_add_svcs(gatt_svr_svcs);
@@ -745,4 +826,5 @@ void app_main(void)
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
+
 
