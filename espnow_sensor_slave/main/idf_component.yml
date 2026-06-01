@@ -16,3 +16,4 @@ dependencies:
   #   public: true
   esp-idf-lib/i2cdev: '*'
   esp-idf-lib/dps310: '*'
+  esp-idf-lib/mpu6050: '*'

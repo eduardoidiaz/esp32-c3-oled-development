@@ -27,12 +27,14 @@
 // Barometer Driver Includes
 #include <i2cdev.h>
 #include <dps310.h>
+#include <mpu6050.h>
 
 // 🛠️ ADD THESE NETWORKING HEADERS FOR ESP-NOW SUPPORT
 #include "esp_netif.h"
 #include "esp_wifi.h"
 #include "esp_now.h"
 #include "esp_mac.h"
+
 
 #include "freertos/timers.h" // Ensure the system timer headers are included
 
@@ -62,6 +64,7 @@ static uint16_t conn_handle;
 
 // Global tracking references for the Barometer
 static dps310_t dps_sensor_dev;
+static mpu6050_dev_t mpu6050_sensor_dev; // Global IMU device profile handle
 
 i2c_master_bus_handle_t bus_handle;
 
@@ -76,11 +79,26 @@ static float remote_board_press = 0.0f;
 float height_change_inches = 0.0f;
 esp_lcd_panel_handle_t panel_handle = NULL;
 
+// Storage variables for the remote MPU6050 streaming data
+volatile float r_acc_x = 0.0f;
+volatile float r_acc_y = 0.0f;
+volatile float r_acc_z = 0.0f;
+volatile float r_gyro_x = 0.0f;
+volatile float r_gyro_y = 0.0f;
+volatile float r_gyro_z = 0.0f;
+
 
 struct __attribute__((packed)) esp_now_payload_t {
-    float temp;
-    float press_hpa;
-};
+    float temp;       // 4 bytes
+    float press_hpa;  // 4 bytes
+    float acc_x;      // 4 bytes (New IMU variables)
+    float acc_y;      // 4 bytes
+    float acc_z;      // 4 bytes
+    float gyro_x;     // 4 bytes
+    float gyro_y;     // 4 bytes
+    float gyro_z;     // 4 bytes
+}; // 🎯 Absolute Total Size: 32 bytes
+
 
 static uint8_t slave_mac_address[6] = {0x88, 0x56, 0xA6, 0x2C, 0x09, 0x44};
 
@@ -105,17 +123,29 @@ static uint16_t counter_chr_val_handle;
 
 // 🎯 REALIGNED DUAL-BOARD ACCURATE DATA MATRIX INTERFACE
 struct __attribute__((packed)) sensor_payload_t {
-    float master_temp;    // [0..3 bytes]   Master Temperature (°C)
-    float master_press;   // [4..7 bytes]   Master Pressure (hPa)
-    float remote_temp;    // [8..11 bytes]  Remote Temperature (°C)
-    float remote_press;   // [12..15 bytes] Remote Pressure (hPa)
-    float height_delta;   // [16..19 bytes] Filtered Relative Height Change (Inches)
+    float master_temp;  // [0..3 bytes] Master Temperature (°C)
+    float master_press; // [4..7 bytes] Master Pressure (hPa)
+    float remote_temp;  // [8..11 bytes] Remote Temperature (°C)
+    float remote_press; // [12..15 bytes] Remote Pressure (hPa)
+    float height_delta; // [16..19 bytes] Filtered Relative Height Change (Inches)
     
-    // 🛠️ PLACEHOLDERS RESERVED FOR FUTURE ACCELEROMETER/SENSOR INTEGRATION:
-    float sensor_x;       // [20..23 bytes] Future Sensor Track X
-    float sensor_y;       // [24..27 bytes] Future Sensor Track Y
-    float sensor_z;       // [28..31 bytes] Future Sensor Track Z
-};
+    // 🛰️ LOCAL MASTER IMU AXIS MATRIX (Now explicit)
+    float master_acc_x; // [20..23 bytes]
+    float master_acc_y; // [24..27 bytes]
+    float master_acc_z; // [28..31 bytes]
+    float master_gyr_x; // [32..35 bytes]
+    float master_gyr_y; // [36..39 bytes]
+    float master_gyr_z; // [40..43 bytes]
+
+    // 📡 REMOTE SLAVE IMU AXIS MATRIX
+    float remote_acc_x; // [44..47 bytes]
+    float remote_acc_y; // [48..51 bytes]
+    float remote_acc_z; // [52..55 bytes]
+    float remote_gyr_x; // [56..59 bytes]
+    float remote_gyr_y; // [60..63 bytes]
+    float remote_gyr_z; // [64..67 bytes]
+}; // 🎯 New Sizing Window: Exactly 68 bytes total payload package
+
 
 // Global instance to map parameters out to the GATT read table
 static struct sensor_payload_t tx_data;
@@ -577,11 +607,35 @@ void ble_app_on_sync(void) {
 }
 
 
-
 void ble_host_task(void *param) {
     ESP_LOGI(TAG, "NimBLE Host Thread Initialized.");
     nimble_port_run(); 
     nimble_port_freertos_deinit();
+}
+
+void init_imu(void) {
+    // Zero out the whole structural block cleanly
+    memset(&mpu6050_sensor_dev, 0, sizeof(mpu6050_dev_t));
+
+    // 🎯 1. BIND DESCRIPTOR WITH YOUR PINS (Handle, Addr, Port, SDA, SCL)
+    esp_err_t err = mpu6050_init_desc(&mpu6050_sensor_dev, 0x68, 0, 5, 6);
+    if (err != ESP_OK) {
+        ESP_LOGE("IMU_ERR", "Descriptor allocation dropped: %s", esp_err_to_name(err));
+        return;
+    }
+
+    // 🎯 2. INITIALIZE HARDWARE CORE TRANSCEIVER INTERRUPT STATES
+    err = mpu6050_init(&mpu6050_sensor_dev);
+    if (err != ESP_OK) {
+        ESP_LOGE("IMU_ERR", "MPU6050 core failed to wake up: %s", esp_err_to_name(err));
+        return;
+    }
+
+    // 🎯 3. SECURE FIXED TELEMETRY GAIN TARGET RANGES NATIVELY
+    ESP_ERROR_CHECK(mpu6050_set_full_scale_gyro_range(&mpu6050_sensor_dev, MPU6050_GYRO_RANGE_250));
+    ESP_ERROR_CHECK(mpu6050_set_full_scale_accel_range(&mpu6050_sensor_dev, MPU6050_ACCEL_RANGE_2));
+
+    ESP_LOGI("IMU_OK", "Slave MPU6050 IMU Bound & Operational!");
 }
 
 void init_barometer(void) {
@@ -638,17 +692,18 @@ void esp_now_recv_callback(const esp_now_recv_info_t *recv_info, const uint8_t *
 
     // SECURE GATEWAY CHECK: Reject any packets that don't come from our specific Slave
     if (recv_info == NULL || memcmp(recv_info->src_addr, slave_mac_address, 6) != 0) {
-        // Discard silently or log ambient noise from other transmitters
-        // ADDED DEBUG LOG: Silently tracks and logs ambient network crosstalk
+        // 📝 FIXED PURE-C LOG: Manually prints the 6-byte hex elements to bypass macro errors
         if (recv_info != NULL) {
-            ESP_LOGD("SECURITY_GUARD", "Ignored rogue ESP-NOW frame from source MAC: " MACSTR, 
-                     MAC2STR(recv_info->src_addr));
+            ESP_LOGD("SECURITY_GUARD", "Ignored rogue ESP-NOW frame from source MAC: %02X:%02X:%02X:%02X:%02X:%02X",
+                     recv_info->src_addr[0], recv_info->src_addr[1], recv_info->src_addr[2],
+                     recv_info->src_addr[3], recv_info->src_addr[4], recv_info->src_addr[5]);
         }
         return; 
     }
 
     esp_lcd_panel_handle_t local_display = panel_handle; // Map global screen context safely
 
+    // 🎯 GATING TARGET DETECTS EXPANED 32-BYTE PAYLOAD SIZE AUTOMATICALLY
     if (len == sizeof(struct esp_now_payload_t)) {
         struct esp_now_payload_t *incoming = (struct esp_now_payload_t *)data;
         remote_board_temp = incoming->temp;
@@ -662,6 +717,15 @@ void esp_now_recv_callback(const esp_now_recv_info_t *recv_info, const uint8_t *
         dps310_calc_altitude(&dps_sensor_dev, m_press, &m_calc_alt);
 
         float m_press_hpa = m_press / 100.0f;
+
+        mpu6050_raw_acceleration_t acce_raw = {0, 0, 0};
+        mpu6050_raw_rotation_t gyro_raw = {0, 0, 0};
+
+        if (mpu6050_get_raw_acceleration(&mpu6050_sensor_dev, &acce_raw) != ESP_OK ||
+            mpu6050_get_raw_rotation(&mpu6050_sensor_dev, &gyro_raw) != ESP_OK) {
+            ESP_LOGW("LOCAL_IMU", "Failed to sample master local IMU over I2C.");
+        }
+
         static float dual_board_baseline_offset = -999.0f;
         
         // 🛠️ LOW-PASS FILTER VARIABLES:
@@ -686,41 +750,48 @@ void esp_now_recv_callback(const esp_now_recv_info_t *recv_info, const uint8_t *
         // THE 1-LINE LOW-PASS EMA FILTER IMPLEMENTATION:
         filtered_height_inches = (alpha * clean_unfiltered_inches) + ((1.0f - alpha) * filtered_height_inches);
         
-        // 🎯 REWRITE THIS LOGIC ON PAGE 16 TO CONVERT NEGATIVE DESK NOISE DRIFT TO ZERO:
+        // 🎯 CONVERT NEGATIVE DESK NOISE DRIFT TO ZERO:
         if (filtered_height_inches < 0.0f) {
-            // If the units sit on the same desk, microbaric noise shouldn't show negative height
             height_change_inches = 0.0f; 
         } else if (fabsf(clean_unfiltered_inches) < 0.3f) {
-            // Freeze calculation if the change is below a tiny 0.3-inch threshold
             height_change_inches = filtered_height_inches;
         } else {
             height_change_inches = filtered_height_inches;
         }
 
-        // 🎯 DIRECT REALIGNED PACKET VALUE ASSIGNMENTS:
+        // 🎯 1. DIRECT REALIGNED PACKET VALUE ASSIGNMENTS:
         tx_data.master_temp  = m_temp;
         tx_data.master_press = m_press_hpa;
         tx_data.remote_temp  = remote_board_temp;
         tx_data.remote_press = remote_board_press;
-        tx_data.height_delta = height_change_inches; // Passes your signed low-pass filtered inches
+        tx_data.height_delta = height_change_inches; // Low-pass filtered inches delta [0x1.22]
 
-        // 🛠️ SAFE RE-ROUTED HARDCODED SEED PLACEHOLDERS FOR FUTURE WORK:
-        tx_data.sensor_x     = 0.0f; 
-        tx_data.sensor_y     = 0.0f;
-        tx_data.sensor_z     = 0.0f;
+        // 🎯 2. MAP LOCAL HARDWARE CHANNELS (Converts to 'g' and '°/s' for iOS) [0x1.23]
+        tx_data.master_acc_x = (float)acce_raw.x / 16384.0f;
+        tx_data.master_acc_y = (float)acce_raw.y / 16384.0f;
+        tx_data.master_acc_z = (float)acce_raw.z / 16384.0f;
+        tx_data.master_gyr_x = (float)gyro_raw.x / 131.0f;
+        tx_data.master_gyr_y = (float)gyro_raw.y / 131.0f;
+        tx_data.master_gyr_z = (float)gyro_raw.z / 131.0f;
 
-        ESP_LOGI("SYNC_ALT","M_Temp: %.2f | M_Pres: %.2f | R_Temp: %.2f | R_Pres: %.2f | Filtered Height: %.2f in", 
-                m_temp , m_press_hpa, remote_board_temp, remote_board_press, height_change_inches);
+        // 🎯 3. MAP REMOTE OVER-THE-AIR CHANNELS (Converts to 'g' and '°/s' for iOS) [0x1.23]
+        tx_data.remote_acc_x = incoming->acc_x / 16384.0f;
+        tx_data.remote_acc_y = incoming->acc_y / 16384.0f;
+        tx_data.remote_acc_z = incoming->acc_z / 16384.0f;
+        tx_data.remote_gyr_x = incoming->gyro_x / 131.0f;
+        tx_data.remote_gyr_y = incoming->gyro_y / 131.0f;
+        tx_data.remote_gyr_z = incoming->gyro_z / 131.0f;
 
-        // 🛠️ ACTIVE SECURITY LOCK:
-        // Check the encryption state of the connection before pushing data frames
+        // Enhanced telemetry matrix log output confirming your new format structure [0x1.23]
+        ESP_LOGI("SYNC_ALT","Data Stream Bundled! Size: %d bytes. Shipping to iPhone notification buffer.", 
+                 (int)sizeof(tx_data));
+
+        // 🛠️ ACTIVE SECURITY LOCK: (Keeps your encrypted NimBLE notification layer rolling seamlessly) [0x1.23]
         if (ble_connected) {
             struct ble_gap_conn_desc desc;
-            
-            // Look up the active connection status via its handle
             if (ble_gap_conn_find(conn_handle, &desc) == 0) {
-                // 🎯 CRITICAL: Check if the connection has completed its encryption handshake!
                 if (desc.sec_state.encrypted) {
+                    // 🚀 The sizeof dynamic expression here automatically shifts to notify the iPhone of all 68 bytes!
                     struct os_mbuf *om = ble_hs_mbuf_from_flat(&tx_data, sizeof(tx_data));
                     if (om != NULL) {
                         ble_gattc_notify_custom(conn_handle, counter_chr_val_handle, om);
@@ -732,22 +803,47 @@ void esp_now_recv_callback(const esp_now_recv_info_t *recv_info, const uint8_t *
         }
 
 
+        // SCALED UNIFIED TELEMETRY LOG ENGINE (WITH METRIC UNITS)
+        // ESP_LOGI("SYNC_ALT", 
+        //          "--- FULL SCALED TELEMETRY MATRIX ---\n"
+        //          "BARO: M_Temp: %.2f C | M_Pres: %.2f hPa\n"
+        //          "BARO: R_Temp: %.2f C | R_Pres: %.2f hPa\n"
+        //          "CALC: Filtered Height: %.2f in\n"
+        //          "LOCAL  IMU: Accel: [%.2fg, %.2fg, %.2fg] | Gyro: [%.1f°/s, %.1f°/s, %.1f°/s]\n"
+        //          "REMOTE IMU: Accel: [%.2fg, %.2fg, %.2fg] | Gyro: [%.1f°/s, %.1f°/s, %.1f°/s]",
+        //          m_temp, m_press_hpa,
+        //          remote_board_temp, remote_board_press,
+        //          height_change_inches,
+                 
+        //          // 🛰️ Local Master Hardware Conversion Calculations (Raw / LSB Sensitivity) [0x1.23]
+        //          (float)acce_raw.x / 16384.0f, (float)acce_raw.y / 16384.0f, (float)acce_raw.z / 16384.0f,
+        //          (float)gyro_raw.x / 131.0f,   (float)gyro_raw.y / 131.0f,   (float)gyro_raw.z / 131.0f,
+                 
+        //          // 📡 Remote Slave Over-the-Air Conversion Calculations [0x1.23]
+        //          incoming->acc_x / 16384.0f, incoming->acc_y / 16384.0f, incoming->acc_z / 16384.0f,
+        //          incoming->gyro_x / 131.0f,   incoming->gyro_y / 131.0f,   incoming->gyro_z / 131.0f);
+
         // Format and refresh your OLED display canvas text frames
-        char t_buf[32], p_buf[32], h_buf[32];
+        char t_buf[32], p_buf[32], h_buf[32], a_buf[32];
         snprintf(t_buf, sizeof(t_buf), "TEMP: %.1f C", m_temp);
         snprintf(p_buf, sizeof(p_buf), "PRES: %.1f hPa", m_press_hpa);
         snprintf(h_buf, sizeof(h_buf), "HGHT: %.1f in", height_change_inches);
+        // snprintf(a_buf, sizeof(a_buf), "ACCZ: %.0f", tx_data.sensor_z);
 
         memset(frame_canvas, 0, sizeof(frame_canvas));
-        draw_string(0, 4, t_buf);
-        draw_string(0, 20, p_buf);
-        draw_string(0, 36, h_buf);
+        draw_string(0, 2, t_buf);
+        draw_string(0, 18, p_buf);
+        draw_string(0, 34, h_buf);
+        draw_string(0, 50, a_buf); // Added live Z-acceleration value display line
 
         if (local_display != NULL) {
             esp_lcd_panel_draw_bitmap(local_display, 0, 0, 128, 64, frame_canvas);
         }
+    } else {
+         ESP_LOGW("ESPNOW_ERR", "Packet Size mismatch! Expected 32, got %d", len);
     }
 }
+
 
 
 
@@ -809,6 +905,7 @@ void app_main(void)
 
     // --- 3. INITIALIZE THE DPS310 BAROMETER SENSOR CORE ---
     init_barometer();
+    init_imu();
     vTaskDelay(pdMS_TO_TICKS(100));
 
     // --- 4. INITIALIZE THE PHYSICAL OLED SCREEN PANEL ---
