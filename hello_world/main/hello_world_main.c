@@ -32,6 +32,7 @@
 #include "esp_netif.h"
 #include "esp_wifi.h"
 #include "esp_now.h"
+#include "esp_mac.h"
 
 #include "freertos/timers.h" // Ensure the system timer headers are included
 
@@ -80,6 +81,8 @@ struct __attribute__((packed)) esp_now_payload_t {
     float temp;
     float press_hpa;
 };
+
+static uint8_t slave_mac_address[6] = {0x88, 0x56, 0xA6, 0x2C, 0x09, 0x44};
 
 
 // 🎯 TRANSLATED ZEPHYR TO NIMBLE UUID CORES
@@ -632,6 +635,18 @@ void init_barometer(void) {
 }
 
 void esp_now_recv_callback(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len) {
+
+    // SECURE GATEWAY CHECK: Reject any packets that don't come from our specific Slave
+    if (recv_info == NULL || memcmp(recv_info->src_addr, slave_mac_address, 6) != 0) {
+        // Discard silently or log ambient noise from other transmitters
+        // ADDED DEBUG LOG: Silently tracks and logs ambient network crosstalk
+        if (recv_info != NULL) {
+            ESP_LOGD("SECURITY_GUARD", "Ignored rogue ESP-NOW frame from source MAC: " MACSTR, 
+                     MAC2STR(recv_info->src_addr));
+        }
+        return; 
+    }
+
     esp_lcd_panel_handle_t local_display = panel_handle; // Map global screen context safely
 
     if (len == sizeof(struct esp_now_payload_t)) {
@@ -667,13 +682,17 @@ void esp_now_recv_callback(const esp_now_recv_info_t *recv_info, const uint8_t *
 
         // Apply baseline calibration tare calibration
         float clean_unfiltered_inches = raw_height_inches - dual_board_baseline_offset;
-
-        // 🛠️ THE 1-LINE LOW-PASS EMA FILTER IMPLEMENTATION:
+        
+        // THE 1-LINE LOW-PASS EMA FILTER IMPLEMENTATION:
         filtered_height_inches = (alpha * clean_unfiltered_inches) + ((1.0f - alpha) * filtered_height_inches);
-
-        // Apply a small signed noise deadzone to freeze absolute desk drift completely
-        if (fabsf(filtered_height_inches) < 1.0f) {
-            height_change_inches = 0.0f;
+        
+        // 🎯 REWRITE THIS LOGIC ON PAGE 16 TO CONVERT NEGATIVE DESK NOISE DRIFT TO ZERO:
+        if (filtered_height_inches < 0.0f) {
+            // If the units sit on the same desk, microbaric noise shouldn't show negative height
+            height_change_inches = 0.0f; 
+        } else if (fabsf(clean_unfiltered_inches) < 0.3f) {
+            // Freeze calculation if the change is below a tiny 0.3-inch threshold
+            height_change_inches = filtered_height_inches;
         } else {
             height_change_inches = filtered_height_inches;
         }
@@ -735,6 +754,9 @@ void esp_now_recv_callback(const esp_now_recv_info_t *recv_info, const uint8_t *
 void init_master_esp_now(void) {
     // 1. Initialize the global network interface system layers
     ESP_ERROR_CHECK(esp_netif_init());
+
+    // This must remain to prevent internal Wi-Fi driver task crashes
+    ESP_ERROR_CHECK(esp_event_loop_create_default()); 
     
     // 2. Load basic Wi-Fi structural configuration presets
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
@@ -749,13 +771,25 @@ void init_master_esp_now(void) {
     // 5. Spin up the physical radio antenna system layers
     ESP_ERROR_CHECK(esp_wifi_start());
 
+    // Lock the radio frequency channel
+    ESP_ERROR_CHECK(esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE));
+
     // 6. Initialize the core peer-to-peer ESP-NOW message transmission engines
     ESP_ERROR_CHECK(esp_now_init());
     
     // 7. Attach your real-time data frame collector callback routing function
     ESP_ERROR_CHECK(esp_now_register_recv_cb(esp_now_recv_callback));
     
-    ESP_LOGI("RADIO_INIT", "ESP-NOW Subsystem Layer Bound Successfully!");
+    // 🎯 ADD THIS PEER REGISTRY BLOCK TO THE MASTER:
+    esp_now_peer_info_t peer_info = {0};
+    memcpy(peer_info.peer_addr, slave_mac_address, 6);
+    peer_info.channel = 1;         // Must match Channel 1
+    peer_info.encrypt = false;
+    peer_info.ifidx = WIFI_IF_STA; // Explicitly map to Master's Station interface
+    
+    ESP_ERROR_CHECK(esp_now_add_peer(&peer_info));
+    
+    ESP_LOGI("RADIO_INIT", "🎯 Target Unicast Link with Slave Board Secured!");
 }
 
 void app_main(void)
