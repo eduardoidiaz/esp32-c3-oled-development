@@ -804,24 +804,24 @@ void esp_now_recv_callback(const esp_now_recv_info_t *recv_info, const uint8_t *
 
 
         // SCALED UNIFIED TELEMETRY LOG ENGINE (WITH METRIC UNITS)
-        // ESP_LOGI("SYNC_ALT", 
-        //          "--- FULL SCALED TELEMETRY MATRIX ---\n"
-        //          "BARO: M_Temp: %.2f C | M_Pres: %.2f hPa\n"
-        //          "BARO: R_Temp: %.2f C | R_Pres: %.2f hPa\n"
-        //          "CALC: Filtered Height: %.2f in\n"
-        //          "LOCAL  IMU: Accel: [%.2fg, %.2fg, %.2fg] | Gyro: [%.1f°/s, %.1f°/s, %.1f°/s]\n"
-        //          "REMOTE IMU: Accel: [%.2fg, %.2fg, %.2fg] | Gyro: [%.1f°/s, %.1f°/s, %.1f°/s]",
-        //          m_temp, m_press_hpa,
-        //          remote_board_temp, remote_board_press,
-        //          height_change_inches,
+        ESP_LOGI("SYNC_ALT", 
+                 "--- FULL SCALED TELEMETRY MATRIX ---\n"
+                 "BARO: M_Temp: %.2f C | M_Pres: %.2f hPa\n"
+                 "BARO: R_Temp: %.2f C | R_Pres: %.2f hPa\n"
+                 "CALC: Filtered Height: %.2f in\n"
+                 "LOCAL  IMU: Accel: [%.2fg, %.2fg, %.2fg] | Gyro: [%.1f°/s, %.1f°/s, %.1f°/s]\n"
+                 "REMOTE IMU: Accel: [%.2fg, %.2fg, %.2fg] | Gyro: [%.1f°/s, %.1f°/s, %.1f°/s]",
+                 m_temp, m_press_hpa,
+                 remote_board_temp, remote_board_press,
+                 height_change_inches,
                  
-        //          // 🛰️ Local Master Hardware Conversion Calculations (Raw / LSB Sensitivity) [0x1.23]
-        //          (float)acce_raw.x / 16384.0f, (float)acce_raw.y / 16384.0f, (float)acce_raw.z / 16384.0f,
-        //          (float)gyro_raw.x / 131.0f,   (float)gyro_raw.y / 131.0f,   (float)gyro_raw.z / 131.0f,
+                 // 🛰️ Local Master Hardware Conversion Calculations (Raw / LSB Sensitivity) [0x1.23]
+                 (float)acce_raw.x / 16384.0f, (float)acce_raw.y / 16384.0f, (float)acce_raw.z / 16384.0f,
+                 (float)gyro_raw.x / 131.0f,   (float)gyro_raw.y / 131.0f,   (float)gyro_raw.z / 131.0f,
                  
-        //          // 📡 Remote Slave Over-the-Air Conversion Calculations [0x1.23]
-        //          incoming->acc_x / 16384.0f, incoming->acc_y / 16384.0f, incoming->acc_z / 16384.0f,
-        //          incoming->gyro_x / 131.0f,   incoming->gyro_y / 131.0f,   incoming->gyro_z / 131.0f);
+                 // 📡 Remote Slave Over-the-Air Conversion Calculations [0x1.23]
+                 incoming->acc_x / 16384.0f, incoming->acc_y / 16384.0f, incoming->acc_z / 16384.0f,
+                 incoming->gyro_x / 131.0f,   incoming->gyro_y / 131.0f,   incoming->gyro_z / 131.0f);
 
         // Format and refresh your OLED display canvas text frames
         char t_buf[32], p_buf[32], h_buf[32], a_buf[32];
