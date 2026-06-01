@@ -160,67 +160,69 @@ void app_main(void) {
     init_barometer();
     init_imu();
 
-    float temp = 0.0, press = 0.0;
-    struct esp_now_payload_t data_packet;
-
-    mpu6050_raw_acceleration_t acce_raw = {0, 0, 0};
-    mpu6050_raw_rotation_t gyro_raw = {0, 0, 0};
+    struct esp_now_payload_t data_packet = {0};
+    
+    // 🎯 1. ALLOCATE THE EMA FILTER MEMORY TRACKERS
+    // Static variables preserve their values between loop iterations
+    static float filtered_acc_x = 0.0f;
+    static float filtered_acc_y = 0.0f;
+    static float filtered_acc_z = 0.0f;
+    
+    // Set your smoothing coefficient (15% new data, 85% historical smoothness)
+    const float imu_alpha = 0.15f; 
+    
+    // Flag to handle the very first packet cleanly without a lag spike
+    static bool first_run = true;
 
     while (1) {
-        if (dps310_read_temp(&dps_sensor_dev, &temp) == ESP_OK && 
-            dps310_read_pressure(&dps_sensor_dev, &press) == ESP_OK) {
-            
+        // Fetch Barometer Metrics as usual...
+        float temp = 0.0f, press = 0.0f;
+        if (dps310_read_pressure(&dps_sensor_dev, &press) == ESP_OK &&
+            dps310_read_temp(&dps_sensor_dev, &temp) == ESP_OK) {
             data_packet.temp = temp;
             data_packet.press_hpa = press / 100.0f;
-
-            // // Broadcast data packet directly to the Master's MAC address
-            // esp_now_send(master_mac_address, (uint8_t *)&data_packet, sizeof(data_packet));
-            // ESP_LOGI(TAG, "Sent -> Temp: %.2f C | Press: %.2f hPa", data_packet.temp, data_packet.press_hpa);
         }
 
-        // Call the strict library functions
+        // Fetch Raw MPU6050 Metrics
+        mpu6050_raw_acceleration_t acce_raw = {0, 0, 0};
+        mpu6050_raw_rotation_t gyro_raw = {0, 0, 0};
+
         if (mpu6050_get_raw_acceleration(&mpu6050_sensor_dev, &acce_raw) == ESP_OK &&
             mpu6050_get_raw_rotation(&mpu6050_sensor_dev, &gyro_raw) == ESP_OK) {
             
-            // Map the parsed float parameters to your over-the-air payload structure
-            data_packet.acc_x = (float)acce_raw.x;
-            data_packet.acc_y = (float)acce_raw.y;
-            data_packet.acc_z = (float)acce_raw.z;
+            float raw_x = (float)acce_raw.x;
+            float raw_y = (float)acce_raw.y;
+            float raw_z = (float)acce_raw.z;
+
+            // 🎯 2. APPLY THE EMA FILTER PATTERN
+            if (first_run) {
+                // Seed the filter with initial hardware states on boot
+                filtered_acc_x = raw_x;
+                filtered_acc_y = raw_y;
+                filtered_acc_z = raw_z;
+                first_run = false;
+            } else {
+                // Execute the standard moving average math
+                filtered_acc_x = (imu_alpha * raw_x) + ((1.0f - imu_alpha) * filtered_acc_x);
+                filtered_acc_y = (imu_alpha * raw_y) + ((1.0f - imu_alpha) * filtered_acc_y);
+                filtered_acc_z = (imu_alpha * raw_z) + ((1.0f - imu_alpha) * filtered_acc_z);
+            }
+
+            // 🎯 3. PACK THE SMOOTHED MEMORY PATHS INTO THE RADIO PAYLOAD
+            data_packet.acc_x = filtered_acc_x;
+            data_packet.acc_y = filtered_acc_y;
+            data_packet.acc_z = filtered_acc_z;
             
+            // Gyroscope values typically pass unfiltered, or can use their own EMA handles
             data_packet.gyro_x = (float)gyro_raw.x;
             data_packet.gyro_y = (float)gyro_raw.y;
             data_packet.gyro_z = (float)gyro_raw.z;
-
-        } else {
-            ESP_LOGW("IMU_LOOP", "MPU6050 transaction dropped on I2C line.");
+            
         }
 
-        // 🚀 Dispatch the newly expanded 32-byte payload via Unicast
-        esp_err_t send_result = esp_now_send(master_mac_address, (uint8_t *)&data_packet, sizeof(data_packet));
-
-        if (send_result == ESP_OK) {
-            // Slave Telemetry Matrix Printout scaled to standard units [0x1.5]
-            /* ⚠️ Important Data Notice: 
-                We do not apply the division to the actual over-the-air payload 
-                parameters (data_packet.acc_x = acce_raw.x;) (0x1.5). We intentionally 
-                keep the data transmitted across the radio as compact 16-bit integers 
-                to preserve transmission speeds and prevent floating-point calculation 
-                overhead across the ESP-NOW air channels (0x1.1). 
-            */
-            ESP_LOGI(TAG, "Sent -> Temp: %.2f C | Press: %.2f hPa | Accel: [%.2fg, %.2fg, %.2fg] | Gyro: [%.1f°/s, %.1f°/s, %.1f°/s]", 
-                 data_packet.temp, 
-                 data_packet.press_hpa,
-                 data_packet.acc_x / 16384.0f, 
-                 data_packet.acc_y / 16384.0f, 
-                 data_packet.acc_z / 16384.0f,
-                 data_packet.gyro_x / 131.0f, 
-                 data_packet.gyro_y / 131.0f, 
-                 data_packet.gyro_z / 131.0f);
-
-        } else {
-            ESP_LOGE(TAG, "Unicast Data Dispatch Blocked! Reason: %s", esp_err_to_name(send_result));
-        }
-
+        // Send the data packet over the air
+        esp_now_send(master_mac_address, (uint8_t *)&data_packet, sizeof(data_packet));
+        
         vTaskDelay(pdMS_TO_TICKS(300));
     }
 }
