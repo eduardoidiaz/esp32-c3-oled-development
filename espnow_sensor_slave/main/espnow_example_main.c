@@ -169,7 +169,7 @@ void app_main(void) {
     static float filtered_acc_z = 0.0f;
     
     // Set your smoothing coefficient (15% new data, 85% historical smoothness)
-    const float imu_alpha = 0.15f; 
+    const float imu_alpha = 0.25f; 
     
     // Flag to handle the very first packet cleanly without a lag spike
     static bool first_run = true;
