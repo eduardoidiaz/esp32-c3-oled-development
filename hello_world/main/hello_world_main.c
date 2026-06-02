@@ -22,8 +22,6 @@
 #include "host/ble_store.h"
 #include "host/ble_hs_pvcy.h"  // 🎯 ADD THIS LINE
 
-
-
 // Barometer Driver Includes
 #include <i2cdev.h>
 #include <dps310.h>
@@ -35,8 +33,125 @@
 #include "esp_now.h"
 #include "esp_mac.h"
 
-
 #include "freertos/timers.h" // Ensure the system timer headers are included
+
+// Pins are safely assigned in your root sdkconfig: MISO=2, MOSI=7, SCK=1, CS=0
+// Updated Pin Definitions to preserve LED (GP8) and BOOT (GP9) safety
+// #define PIN_UWB_MISO   2
+// #define PIN_UWB_MOSI   7
+// #define PIN_UWB_SCK    1   
+// #define PIN_UWB_CS     0   // Shifted away from your continuous cluster to keep GP8 and GP9 free
+// #define PIN_UWB_RST    3
+// #define PIN_UWB_IRQ    4
+
+// ====================================================================
+// 🛰️ QORVO DWM3000 UWB NATIVE INTEGRATION & DIRECT SPI VERIFICATION
+// ====================================================================
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// Pull in the default ESP-IDF SPI Master drivers directly
+#include "driver/spi_master.h"
+#include "esp_log.h"
+#include <string.h>
+
+#ifdef __cplusplus
+}
+#endif
+
+// Safety pin definitions protecting your status LED (GPIO 8) and I2C lines
+#define PIN_UWB_MISO   2
+#define PIN_UWB_MOSI   7
+#define PIN_UWB_SCK    1   
+#define PIN_UWB_CS     0   
+
+static spi_device_handle_t direct_uwb_spi = NULL;
+
+// Dedicated initialization function resolving bus contention issues safely
+static esp_err_t local_init_uwb_hardware(void) {
+    spi_bus_config_t bus_cfg = {
+        .miso_io_num = PIN_UWB_MISO,
+        .mosi_io_num = PIN_UWB_MOSI,
+        .sclk_io_num = PIN_UWB_SCK,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+    };
+    
+    // Attempt initialization. Pass cleanly if another peripheral stack initialized SPI2 first.
+    esp_err_t ret = spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_CH_AUTO);
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        return ret;
+    }
+
+    spi_device_interface_config_t dev_cfg = {
+        .clock_speed_hz = 2000000, // Safe 2MHz Baseline for device configuration reads
+        .mode = 0,                 // SPI Mode 0 (CPOL=0, CPHA=0) required by DWM3000
+        .spics_io_num = PIN_UWB_CS,
+        .queue_size = 1,
+    };
+    return spi_bus_add_device(SPI2_HOST, &dev_cfg, &direct_uwb_spi);
+}
+
+// ====================================================================
+// 🎯 BACKGROUND WORKER TASK ENGINE (Bypasses Driver Crashing Layers)
+// ====================================================================
+void uwb_core_task(void *pvParameters) {
+    ESP_LOGI("UWB_TASK", "Initializing raw direct UWB SPI bus configuration...");
+    
+    if (local_init_uwb_hardware() != ESP_OK || direct_uwb_spi == NULL) {
+        ESP_LOGE("UWB_TASK", "Critical: Direct SPI peripheral mapping failed!");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(100)); // Allow voltage lines and clock crystal to fully stabilize
+
+    while (1) {
+        // 🎯 THE DIRECT HARDWARE READ TRANSACTION:
+        // Byte 0: 0x00 -> Fast Access Command Read for Register File 0x0 (DEV_ID)
+        // Byte 1-4: 0x00 -> Transmitting dummy data while reading back 4 bytes
+        uint8_t tx_buf[5] = {0x00, 0x00, 0x00, 0x00, 0x00};
+        uint8_t rx_buf[5] = {0x00, 0x00, 0x00, 0x00, 0x00};
+
+        spi_transaction_t t = {
+            .length = 5 * 8, // 5 bytes total = 40 bits
+            .tx_buffer = tx_buf,
+            .rx_buffer = rx_buf
+        };
+
+        // Execute raw full-duplex SPI block (CS dropped and pulled high automatically)
+        if (spi_device_transmit(direct_uwb_spi, &t) == ESP_OK) {
+            
+            // 🎯 THE BITMASK CORRECTION: 
+            // Shift indices right by 1 space to account for the leading full-duplex dummy byte (rx_buf[0])
+            uint32_t dev_id = ((uint32_t)rx_buf[4] << 24) | 
+                              ((uint32_t)rx_buf[3] << 16) | 
+                              ((uint32_t)rx_buf[2] << 8)  | 
+                              (uint32_t)rx_buf[1];
+
+            ESP_LOGI("UWB_TASK", "Raw Transferred Bytes: %02X %02X %02X %02X %02X", 
+                     rx_buf[0], rx_buf[1], rx_buf[2], rx_buf[3], rx_buf[4]);
+
+            // Compare against the exact verified Qorvo Chip silicon footprint
+            if (dev_id == 0xDECA0302) {
+                ESP_LOGI("UWB_TASK", "🚀 SUCCESS: Directly verified communication with DWM3000! ID: 0x%08X", dev_id);
+            } else if (dev_id == 0x00000000 || dev_id == 0xFFFFFFFF) {
+                ESP_LOGE("UWB_TASK", "ERROR: Flatline data response. Double-check your hardware J1 jumper cap position!");
+            } else {
+                // If it is offset by another factor, print out the unaligned footprint
+                ESP_LOGW("UWB_TASK", "WARNING: Received unaligned data stream: 0x%08X.", dev_id);
+            }
+        } else {
+            ESP_LOGE("UWB_TASK", "Critical SPI transaction error encountered over bus lines.");
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+}
+
+
+
 
 static TimerHandle_t security_watchdog_timer = NULL;
 
@@ -67,6 +182,7 @@ static dps310_t dps_sensor_dev;
 static mpu6050_dev_t mpu6050_sensor_dev; // Global IMU device profile handle
 
 i2c_master_bus_handle_t bus_handle;
+static spi_device_handle_t uwb_spi_handle;
 
 // Shared global data buffers to pass values down into the GATT read pipelines
 char counter_string[32]; 
@@ -888,6 +1004,7 @@ void init_master_esp_now(void) {
     ESP_LOGI("RADIO_INIT", "🎯 Target Unicast Link with Slave Board Secured!");
 }
 
+
 void app_main(void)
 {
     // --- 1. INITIALIZE SYSTEM FLASH MEMORY ---
@@ -993,6 +1110,9 @@ void app_main(void)
 
     // Spawn background task thread layer to handle Bluetooth advertising callbacks
     xTaskCreate(ble_host_task, "ble_host_task", 4096, NULL, 5, NULL);
+
+    xTaskCreate(uwb_core_task, "uwb_core_task", 4096, NULL, 4, NULL);
+
 
     ESP_LOGI(TAG, "Starting Master Heartbeat Thread Lane...");
 
