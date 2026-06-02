@@ -37,119 +37,66 @@
 
 // Pins are safely assigned in your root sdkconfig: MISO=2, MOSI=7, SCK=1, CS=0
 // Updated Pin Definitions to preserve LED (GP8) and BOOT (GP9) safety
-// #define PIN_UWB_MISO   2
-// #define PIN_UWB_MOSI   7
-// #define PIN_UWB_SCK    1   
-// #define PIN_UWB_CS     0   // Shifted away from your continuous cluster to keep GP8 and GP9 free
-// #define PIN_UWB_RST    3
-// #define PIN_UWB_IRQ    4
-
-// ====================================================================
-// 🛰️ QORVO DWM3000 UWB NATIVE INTEGRATION & DIRECT SPI VERIFICATION
-// ====================================================================
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-// Pull in the default ESP-IDF SPI Master drivers directly
-#include "driver/spi_master.h"
-#include "esp_log.h"
-#include <string.h>
-
-#ifdef __cplusplus
-}
-#endif
-
-// Safety pin definitions protecting your status LED (GPIO 8) and I2C lines
 #define PIN_UWB_MISO   2
 #define PIN_UWB_MOSI   7
 #define PIN_UWB_SCK    1   
-#define PIN_UWB_CS     0   
+#define PIN_UWB_CS     10   // Shifted away from your continuous cluster to keep GP8 and GP9 free
+#define PIN_UWB_RST    3
+#define PIN_UWB_IRQ    4
+// 🎯 Define a dedicated, physical hardware wakeup pin
+#define PIN_UWB_WAKEUP 9  // Use a completely free GPIO pin
 
-static spi_device_handle_t direct_uwb_spi = NULL;
 
-// Dedicated initialization function resolving bus contention issues safely
-static esp_err_t local_init_uwb_hardware(void) {
-    spi_bus_config_t bus_cfg = {
-        .miso_io_num = PIN_UWB_MISO,
-        .mosi_io_num = PIN_UWB_MOSI,
-        .sclk_io_num = PIN_UWB_SCK,
-        .quadwp_io_num = -1,
-        .quadhd_io_num = -1,
-    };
-    
-    // Attempt initialization. Pass cleanly if another peripheral stack initialized SPI2 first.
-    esp_err_t ret = spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_CH_AUTO);
-    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-        return ret;
-    }
+#include "deca_interface.h"  
+#include "dw3000_spi.h"      
+#include "dw3000_hw.h"
 
-    spi_device_interface_config_t dev_cfg = {
-        .clock_speed_hz = 2000000, // Safe 2MHz Baseline for device configuration reads
-        .mode = 0,                 // SPI Mode 0 (CPOL=0, CPHA=0) required by DWM3000
-        .spics_io_num = PIN_UWB_CS,
-        .queue_size = 1,
-    };
-    return spi_bus_add_device(SPI2_HOST, &dev_cfg, &direct_uwb_spi);
-}
+// 🎯 FIX 1: Remove 'const' qualifier from external linkage declaration
+// This gives dwt_probe permissions to mutate internal handle mappings natively
+extern struct dwt_probe_s dw3000_probe_interf;
 
-// ====================================================================
-// 🎯 BACKGROUND WORKER TASK ENGINE (Bypasses Driver Crashing Layers)
-// ====================================================================
-void uwb_core_task(void *pvParameters) {
-    ESP_LOGI("UWB_TASK", "Initializing raw direct UWB SPI bus configuration...");
-    
-    if (local_init_uwb_hardware() != ESP_OK || direct_uwb_spi == NULL) {
-        ESP_LOGE("UWB_TASK", "Critical: Direct SPI peripheral mapping failed!");
+void uwb_core_task(void *pvParameters)
+{
+    ESP_LOGI("UWB_TASK", "Initializing native component hardware layers...");
+
+    // 1. 🎯 FIX: Remove the manual dw3000_spi_init() call completely!
+    // dw3000_hw_init() will handle it internally without throwing a resource collision.
+
+    // 2. Initialize the pins (This automatically triggers a safe, singular SPI init)
+    int hw_err = dw3000_hw_init();
+    if (hw_err != ESP_OK) {
+        ESP_LOGE("UWB_TASK", "🛑 CRITICAL: Hardware layer boundary setup failed! Code: %d", hw_err);
         vTaskDelete(NULL);
         return;
     }
 
-    vTaskDelay(pdMS_TO_TICKS(100)); // Allow voltage lines and clock crystal to fully stabilize
+    // 3. Clear out transceiver logic states
+    dw3000_hw_reset();
+    vTaskDelay(pdMS_TO_TICKS(50)); 
+
+    // 4. Run the driver matching probe routine
+    ESP_LOGI("UWB_TASK", "Probing interface layout driver mappings...");
+    int32_t probe_rc = dwt_probe(&dw3000_probe_interf);
+
+    if (probe_rc != DWT_SUCCESS) {
+        ESP_LOGE("UWB_TASK", "🛑 CRITICAL: Qorvo DW3000 interface probe table layout failed! RC: %ld", probe_rc);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    // 5. Run the device configuration script
+    if (dwt_initialise(DWT_DW_INIT) == DWT_ERROR) {
+        ESP_LOGE("UWB_TASK", "🛑 CRITICAL: DW3000 internal register configuration failed!");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI("UWB_TASK", "🎯 SUCCESS: DW3000 Transceiver operational, bound, and ready!");
 
     while (1) {
-        // 🎯 THE DIRECT HARDWARE READ TRANSACTION:
-        // Byte 0: 0x00 -> Fast Access Command Read for Register File 0x0 (DEV_ID)
-        // Byte 1-4: 0x00 -> Transmitting dummy data while reading back 4 bytes
-        uint8_t tx_buf[5] = {0x00, 0x00, 0x00, 0x00, 0x00};
-        uint8_t rx_buf[5] = {0x00, 0x00, 0x00, 0x00, 0x00};
-
-        spi_transaction_t t = {
-            .length = 5 * 8, // 5 bytes total = 40 bits
-            .tx_buffer = tx_buf,
-            .rx_buffer = rx_buf
-        };
-
-        // Execute raw full-duplex SPI block (CS dropped and pulled high automatically)
-        if (spi_device_transmit(direct_uwb_spi, &t) == ESP_OK) {
-            
-            // 🎯 THE BITMASK CORRECTION: 
-            // Shift indices right by 1 space to account for the leading full-duplex dummy byte (rx_buf[0])
-            uint32_t dev_id = ((uint32_t)rx_buf[4] << 24) | 
-                              ((uint32_t)rx_buf[3] << 16) | 
-                              ((uint32_t)rx_buf[2] << 8)  | 
-                              (uint32_t)rx_buf[1];
-
-            ESP_LOGI("UWB_TASK", "Raw Transferred Bytes: %02X %02X %02X %02X %02X", 
-                     rx_buf[0], rx_buf[1], rx_buf[2], rx_buf[3], rx_buf[4]);
-
-            // Compare against the exact verified Qorvo Chip silicon footprint
-            if (dev_id == 0xDECA0302) {
-                ESP_LOGI("UWB_TASK", "🚀 SUCCESS: Directly verified communication with DWM3000! ID: 0x%08X", dev_id);
-            } else if (dev_id == 0x00000000 || dev_id == 0xFFFFFFFF) {
-                ESP_LOGE("UWB_TASK", "ERROR: Flatline data response. Double-check your hardware J1 jumper cap position!");
-            } else {
-                // If it is offset by another factor, print out the unaligned footprint
-                ESP_LOGW("UWB_TASK", "WARNING: Received unaligned data stream: 0x%08X.", dev_id);
-            }
-        } else {
-            ESP_LOGE("UWB_TASK", "Critical SPI transaction error encountered over bus lines.");
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(2000));
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
-
 
 
 
@@ -182,7 +129,6 @@ static dps310_t dps_sensor_dev;
 static mpu6050_dev_t mpu6050_sensor_dev; // Global IMU device profile handle
 
 i2c_master_bus_handle_t bus_handle;
-static spi_device_handle_t uwb_spi_handle;
 
 // Shared global data buffers to pass values down into the GATT read pipelines
 char counter_string[32]; 
@@ -939,22 +885,22 @@ void esp_now_recv_callback(const esp_now_recv_info_t *recv_info, const uint8_t *
                  incoming->acc_x / 16384.0f, incoming->acc_y / 16384.0f, incoming->acc_z / 16384.0f,
                  incoming->gyro_x / 131.0f,   incoming->gyro_y / 131.0f,   incoming->gyro_z / 131.0f);
 
-        // Format and refresh your OLED display canvas text frames
-        char t_buf[32], p_buf[32], h_buf[32], a_buf[32];
-        snprintf(t_buf, sizeof(t_buf), "TEMP: %.1f C", m_temp);
-        snprintf(p_buf, sizeof(p_buf), "PRES: %.1f hPa", m_press_hpa);
-        snprintf(h_buf, sizeof(h_buf), "HGHT: %.1f in", height_change_inches);
-        // snprintf(a_buf, sizeof(a_buf), "ACCZ: %.0f", tx_data.sensor_z);
+        // // Format and refresh your OLED display canvas text frames
+        // char t_buf[32], p_buf[32], h_buf[32], a_buf[32];
+        // snprintf(t_buf, sizeof(t_buf), "TEMP: %.1f C", m_temp);
+        // snprintf(p_buf, sizeof(p_buf), "PRES: %.1f hPa", m_press_hpa);
+        // snprintf(h_buf, sizeof(h_buf), "HGHT: %.1f in", height_change_inches);
+        // // snprintf(a_buf, sizeof(a_buf), "ACCZ: %.0f", tx_data.sensor_z);
 
-        memset(frame_canvas, 0, sizeof(frame_canvas));
-        draw_string(0, 2, t_buf);
-        draw_string(0, 18, p_buf);
-        draw_string(0, 34, h_buf);
-        draw_string(0, 50, a_buf); // Added live Z-acceleration value display line
+        // memset(frame_canvas, 0, sizeof(frame_canvas));
+        // draw_string(0, 2, t_buf);
+        // draw_string(0, 18, p_buf);
+        // draw_string(0, 34, h_buf);
+        // draw_string(0, 50, a_buf); // Added live Z-acceleration value display line
 
-        if (local_display != NULL) {
-            esp_lcd_panel_draw_bitmap(local_display, 0, 0, 128, 64, frame_canvas);
-        }
+        // if (local_display != NULL) {
+        //     esp_lcd_panel_draw_bitmap(local_display, 0, 0, 128, 64, frame_canvas);
+        // }
     } else {
          ESP_LOGW("ESPNOW_ERR", "Packet Size mismatch! Expected 32, got %d", len);
     }
@@ -1026,6 +972,7 @@ void app_main(void)
     vTaskDelay(pdMS_TO_TICKS(100));
 
     // --- 4. INITIALIZE THE PHYSICAL OLED SCREEN PANEL ---
+    /*
     esp_lcd_panel_io_handle_t io_handle = NULL;
     panel_handle = NULL; // Assign directly into your global tracker variable
 
@@ -1053,6 +1000,7 @@ void app_main(void)
     esp_lcd_panel_init(panel_handle);
     esp_lcd_panel_set_gap(panel_handle, 0, 0); 
     esp_lcd_panel_disp_on_off(panel_handle, true);
+    */
 
     // --- 5. INITIALIZE DIAGNOSTIC LED PIN ---
     gpio_reset_pin(LED_PIN_B);
@@ -1060,9 +1008,9 @@ void app_main(void)
     int led_state = 0;
 
     // Clear frame buffer layout spaces natively
-    memset(frame_canvas, 0x00, sizeof(frame_canvas));
-    ESP_ERROR_CHECK(esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, 128, 64, frame_canvas));
-    vTaskDelay(pdMS_TO_TICKS(100));
+    // memset(frame_canvas, 0x00, sizeof(frame_canvas));
+    // ESP_ERROR_CHECK(esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, 128, 64, frame_canvas));
+    // vTaskDelay(pdMS_TO_TICKS(100));
 
     // --- 6. INITIALIZE COEXISTENCE RADIO STEP A: WIRELESS ESP-NOW FIRST ---
     // This safely reserves the underlying Wi-Fi MAC stacks before BLE spins up
