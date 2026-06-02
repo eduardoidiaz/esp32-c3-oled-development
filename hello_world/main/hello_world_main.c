@@ -72,6 +72,9 @@ void uwb_core_task(void *pvParameters)
     dw3000_hw_reset();
     vTaskDelay(pdMS_TO_TICKS(50)); 
 
+    // uint32_t dev_id = dwt_readdevid();
+    // ESP_LOGE("DEVID: ","%x", dev_id);
+
     // 4. Run the driver matching probe routine
     ESP_LOGI("UWB_TASK", "Probing interface layout driver mappings...");
     // FIX: Forcefully cast away the const modifier so dwt_probe can pass compilation 
@@ -93,7 +96,23 @@ void uwb_core_task(void *pvParameters)
     ESP_LOGI("UWB_TASK", "🎯 SUCCESS: DW3000 Transceiver operational, bound, and ready!");
 
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        vTaskDelay(pdMS_TO_TICKS(2000)); // Send every 2 seconds
+    
+        // Standard dummy blink/ping packet payload
+        uint8_t tx_packet[] = {0x41, 0x88, 0, 0xCA, 0xDE, 'P', 'I', 'N', 'G'}; 
+        
+        // Write data bytes into the DW3000 internal TX buffer memory
+        dwt_writetxdata(sizeof(tx_packet), tx_packet, 0);
+        dwt_writetxfctrl(sizeof(tx_packet), 0, 0);
+        
+        // Command the transmitter to fire immediately into the air
+        if (dwt_starttx(DWT_START_TX_IMMEDIATE) == DWT_SUCCESS) {
+            ESP_LOGI("UWB_TASK", "📡 Blind packet fired from Anchor into the air!");
+        } else {
+            ESP_LOGW("UWB_TASK", "Failed to initiate TX start command.");
+        }
+        
+        ESP_LOGE("UWB_TASK", "Inside loop!");
     }
 }
 
