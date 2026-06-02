@@ -51,9 +51,7 @@
 #include "dw3000_spi.h"      
 #include "dw3000_hw.h"
 
-// 🎯 FIX 1: Remove 'const' qualifier from external linkage declaration
-// This gives dwt_probe permissions to mutate internal handle mappings natively
-extern struct dwt_probe_s dw3000_probe_interf;
+extern const struct dwt_probe_s dw3000_probe_interf;
 
 void uwb_core_task(void *pvParameters)
 {
@@ -76,7 +74,8 @@ void uwb_core_task(void *pvParameters)
 
     // 4. Run the driver matching probe routine
     ESP_LOGI("UWB_TASK", "Probing interface layout driver mappings...");
-    int32_t probe_rc = dwt_probe(&dw3000_probe_interf);
+    // FIX: Forcefully cast away the const modifier so dwt_probe can pass compilation 
+    int32_t probe_rc = dwt_probe((struct dwt_probe_s *)&dw3000_probe_interf);
 
     if (probe_rc != DWT_SUCCESS) {
         ESP_LOGE("UWB_TASK", "🛑 CRITICAL: Qorvo DW3000 interface probe table layout failed! RC: %ld", probe_rc);
