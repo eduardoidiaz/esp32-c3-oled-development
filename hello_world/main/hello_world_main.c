@@ -51,7 +51,71 @@
 #include "dw3000_spi.h"      
 #include "dw3000_hw.h"
 
+#include "dw3000_deca_regs.h" // 🎯 Pulls directly from your provided register file
+
+void print_dw3000_config(const char* node_name) {
+    ESP_LOGI("UWB_DIAG", "=================================================");
+    ESP_LOGI("UWB_DIAG", "📡 CONFIGURATION MATRIX FOR NODE: %s", node_name);
+
+    // 1. Read Device ID
+    uint32_t dev_id = dwt_read_reg(DEV_ID_ID); // [0x1.1]
+    ESP_LOGI("UWB_DIAG", "• Device ID: 0x%08X", (unsigned int)dev_id);
+
+    // 2. Read Radio Channel & Preamble configurations from CHAN_CTRL (0x10014)
+    uint32_t chan_ctrl = dwt_read_reg(CHAN_CTRL_ID); // [0x1.13]
+    uint8_t rf_chan = (chan_ctrl & CHAN_CTRL_RF_CHAN_BIT_MASK) ? 9 : 5; // Bit 0 determines Chan 5 vs 9 [0x1.13]
+    uint8_t tx_code = (chan_ctrl & CHAN_CTRL_TX_PCODE_BIT_MASK) >> CHAN_CTRL_TX_PCODE_BIT_OFFSET; // Bits 3-7 [0x1.13]
+    uint8_t rx_code = (chan_ctrl & CHAN_CTRL_RX_PCODE_BIT_MASK) >> CHAN_CTRL_RX_PCODE_BIT_OFFSET; // Bits 8-12 [0x1.13]
+
+    ESP_LOGI("UWB_DIAG", "• Radio Channel: Channel %d", rf_chan);
+    ESP_LOGI("UWB_DIAG", "• Preamble Codes: TX Code = %d | RX Code = %d", tx_code, rx_code);
+
+    // 3. Read System Configurations from SYS_CFG (0x10)
+    uint32_t sys_cfg = dwt_read_reg(SYS_CFG_ID); // [0x1.2]
+    // Check if the 6.8 Mbps PHR bit is set [0x1.3]
+    const char* rate_str = (sys_cfg & SYS_CFG_PHR_6M8_BIT_MASK) ? "6.8 Mbps" : "850 Kbps"; 
+    // Check if Frame Filtering engine flag is globally enabled in hardware [0x1.3]
+    const char* ff_str = (sys_cfg & SYS_CFG_FFEN_BIT_MASK) ? "ENABLED" : "DISABLED";
+
+    ESP_LOGI("UWB_DIAG", "• PHY Header Data Rate Mode: %s", rate_str);
+    ESP_LOGI("UWB_DIAG", "• Global Frame Filter Engine: %s", ff_str);
+
+    // 4. Read Detailed Address Filter Rules from ADR_FILT_CFG (0x14)
+    uint32_t adr_filt = dwt_read_reg(ADR_FILT_CFG_ID); // [0x1.3]
+    ESP_LOGI("UWB_DIAG", "• Raw Address Filter Rules Matrix (ADR_FILT_CFG): 0x%04X", (unsigned int)(adr_filt & 0xFFFF));
+    ESP_LOGI("UWB_DIAG", "=================================================");
+}
+
+
+
+
 extern const struct dwt_probe_s dw3000_probe_interf;
+
+// 🎯 ADD THIS TO THE TOP OF MASTER MAIN.C
+static dwt_config_t tx_config = {
+    .chan           = 5,                // Channel 5 (6.5 GHz)
+    .txPreambLength = DWT_PLEN_128,     // Preamble length
+    .rxPAC          = DWT_PAC8,         // PAC size
+    .txCode         = 9,                // Preamble Code 9
+    .rxCode         = 9,                // Preamble Code 9
+    .sfdType        = 1,                // 1 for DW 8-bit short SFD
+    .dataRate       = DWT_BR_850K,      // 850 Kbps long-range mode
+    .phrMode        = DWT_PHRMODE_STD,  // Standard PHY header
+    .phrRate        = DWT_PHRRATE_STD,  // Standard PHY rate
+    .sfdTO          = (128 + 1 + 8 - 8),// Matching expanded timeout window
+    .stsMode        = DWT_STS_MODE_OFF, // STS off
+    .stsLength      = DWT_STS_LEN_64,   // Standard STS length
+    .pdoaMode       = DWT_PDOA_M0       // PDOA mode off
+};
+
+// Configure TX Power control (Reg: 0x1E)
+// Lower the transmission power level to its minimal safe desktop testing state
+
+dwt_txconfig_t tx_power_config = {
+    .PGdly = 0x34,       // Standard Pulse Generator delay value for Channel 5
+    .power = 0x0E0E0E0E  // Lower raw power registers uniformly (or use driver low power macro)
+};
+
 
 void uwb_core_task(void *pvParameters)
 {
@@ -93,27 +157,41 @@ void uwb_core_task(void *pvParameters)
         return;
     }
 
+    // 🎯 ADD THIS LINE TO APPLY TX PARAMS
+    dwt_configure(&tx_config); 
+    dwt_configuretxrf(&tx_power_config);
+
     ESP_LOGI("UWB_TASK", "🎯 SUCCESS: DW3000 Transceiver operational, bound, and ready!");
 
-    while (1) {
-        vTaskDelay(pdMS_TO_TICKS(2000)); // Send every 2 seconds
-    
-        // Standard dummy blink/ping packet payload
-        uint8_t tx_packet[] = {0x41, 0x88, 0, 0xCA, 0xDE, 'P', 'I', 'N', 'G'}; 
+    print_dw3000_config("MASTER_ANCHOR");
+
+        while (1) { // [0x1.14]
+        vTaskDelay(pdMS_TO_TICKS(2000)); // Broadcast every 2 seconds [0x1.14]
         
-        // Write data bytes into the DW3000 internal TX buffer memory
-        dwt_writetxdata(sizeof(tx_packet), tx_packet, 0);
-        dwt_writetxfctrl(sizeof(tx_packet), 0, 0);
+        // 🎯 FIX A: Add 2 trailing 0x00 placeholder bytes to reserve space for the hardware CRC
+        uint8_t tx_packet[] = { // [0x1.14]
+            0x41, 0x88,         // 1. Frame Control Field [0x1.14]
+            0x00,               // 2. Sequence Number [0x1.14]
+            0xCA, 0xDE,         // 3. Destination PAN ID [0x1.14]
+            0x02, 0x00,         // 4. Destination Short Address [0x1.14]
+            0x01, 0x00,         // 5. Source Short Address [0x1.15]
+            'P', 'I', 'N', 'G', // 6. Data characters [0x1.15]
+            0x00, 0x00          // 7. 🎯 CRC placeholders (Bypasses Tx Underflow Panic)
+        }; 
         
-        // Command the transmitter to fire immediately into the air
-        if (dwt_starttx(DWT_START_TX_IMMEDIATE) == DWT_SUCCESS) {
-            ESP_LOGI("UWB_TASK", "📡 Blind packet fired from Anchor into the air!");
-        } else {
-            ESP_LOGW("UWB_TASK", "Failed to initiate TX start command.");
+        // 🎯 FIX B: Write all 15 bytes over the SPI bus into the hardware TX buffer
+        dwt_writetxdata(sizeof(tx_packet), tx_packet, 0); // [0x1.15, 0x1.39]
+        
+        // 🎯 FIX C: Frame Length matches written length perfectly (Disable ranging bit for simplicity)
+        dwt_writetxfctrl(sizeof(tx_packet), 0, 0); // [0x1.39]
+        
+        // Force the physical antenna to transmit the frame immediately
+        if (dwt_starttx(DWT_START_TX_IMMEDIATE) == DWT_SUCCESS) { // [0x1.15]
+            ESP_LOGI("UWB_TX", "📡 Structured 802.15.4 Frame broadcasted into the air!"); // [0x1.15]
         }
-        
-        ESP_LOGE("UWB_TASK", "Inside loop!");
     }
+
+
 }
 
 

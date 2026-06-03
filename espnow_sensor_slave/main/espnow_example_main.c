@@ -10,10 +10,57 @@
 #include <dps310.h>
 #include <mpu6050.h> // Ensure your component include path matches your mpu6050 library layout
 
+#include "deca_device_api.h"
+#include "deca_interface.h"
+#include "dw3000_deca_regs.h"
+
+#include "dw3000_hw.h"      // Maps dw3000_hw_init() and dw3000_hw_reset()
+#include "dw3000_spi.h"     // Maps your underlying SPI peripheral bindings
+
+void print_dw3000_config(const char* node_name) {
+    ESP_LOGI("UWB_DIAG", "=================================================");
+    ESP_LOGI("UWB_DIAG", "📡 CONFIGURATION MATRIX FOR NODE: %s", node_name);
+
+    // 1. Read Device ID
+    uint32_t dev_id = dwt_read_reg(DEV_ID_ID); // [0x1.1]
+    ESP_LOGI("UWB_DIAG", "• Device ID: 0x%08X", (unsigned int)dev_id);
+
+    // 2. Read Radio Channel & Preamble configurations from CHAN_CTRL (0x10014)
+    uint32_t chan_ctrl = dwt_read_reg(CHAN_CTRL_ID); // [0x1.13]
+    uint8_t rf_chan = (chan_ctrl & CHAN_CTRL_RF_CHAN_BIT_MASK) ? 9 : 5; // Bit 0 determines Chan 5 vs 9 [0x1.13]
+    uint8_t tx_code = (chan_ctrl & CHAN_CTRL_TX_PCODE_BIT_MASK) >> CHAN_CTRL_TX_PCODE_BIT_OFFSET; // Bits 3-7 [0x1.13]
+    uint8_t rx_code = (chan_ctrl & CHAN_CTRL_RX_PCODE_BIT_MASK) >> CHAN_CTRL_RX_PCODE_BIT_OFFSET; // Bits 8-12 [0x1.13]
+
+    ESP_LOGI("UWB_DIAG", "• Radio Channel: Channel %d", rf_chan);
+    ESP_LOGI("UWB_DIAG", "• Preamble Codes: TX Code = %d | RX Code = %d", tx_code, rx_code);
+
+    // 3. Read System Configurations from SYS_CFG (0x10)
+    uint32_t sys_cfg = dwt_read_reg(SYS_CFG_ID); // [0x1.2]
+    // Check if the 6.8 Mbps PHR bit is set [0x1.3]
+    const char* rate_str = (sys_cfg & SYS_CFG_PHR_6M8_BIT_MASK) ? "6.8 Mbps" : "850 Kbps"; 
+    // Check if Frame Filtering engine flag is globally enabled in hardware [0x1.3]
+    const char* ff_str = (sys_cfg & SYS_CFG_FFEN_BIT_MASK) ? "ENABLED" : "DISABLED";
+
+    ESP_LOGI("UWB_DIAG", "• PHY Header Data Rate Mode: %s", rate_str);
+    ESP_LOGI("UWB_DIAG", "• Global Frame Filter Engine: %s", ff_str);
+
+    // 4. Read Detailed Address Filter Rules from ADR_FILT_CFG (0x14)
+    uint32_t adr_filt = dwt_read_reg(ADR_FILT_CFG_ID); // [0x1.3]
+    ESP_LOGI("UWB_DIAG", "• Raw Address Filter Rules Matrix (ADR_FILT_CFG): 0x%04X", (unsigned int)(adr_filt & 0xFFFF));
+    ESP_LOGI("UWB_DIAG", "=================================================");
+}
 
 // 🛠️ FIXING THE DRIVER HEADER BUG ON THE SLAVE EXPLICITLY:
 #undef DPS310_AVERAGE_SEA_LEVEL_PRESSURE_Pa
 #define DPS310_AVERAGE_SEA_LEVEL_PRESSURE_Pa (101325.0f) // True standard sea-level pressure in Pascals
+
+// Define your Slave's physical SPI pin mapping
+#define PIN_UWB_MISO   2
+#define PIN_UWB_MOSI   7
+#define PIN_UWB_SCK    1 
+#define PIN_UWB_CS     10 
+#define PIN_UWB_RST    3
+#define PIN_UWB_IRQ    4
 
 static const char *TAG = "Remote_Sensor_Slave";
 
@@ -22,6 +69,8 @@ static uint8_t master_mac_address[6] = {0x70, 0xAF, 0x09, 0x3B, 0xD8, 0x8C};
 
 static dps310_t dps_sensor_dev;
 static mpu6050_dev_t mpu6050_sensor_dev; // Global IMU device profile handle
+// Bind these to your custom esp_spi read/write functions like you did on the anchor!
+extern struct dwt_spi_s dw3000_spi; 
 
 struct __attribute__((packed)) esp_now_payload_t {
     float temp;       // 4 bytes
@@ -33,6 +82,146 @@ struct __attribute__((packed)) esp_now_payload_t {
     float gyro_y;     // 4 bytes
     float gyro_z;     // 4 bytes
 }; // 🎯 Absolute Total Size: 32 bytes
+
+// Use the exact same channel configurations (Channel 5, 6.8 Mbps) as your Anchor!
+static dwt_config_t rx_config = {
+    .chan           = 5,                // Channel number (6.5 GHz)
+    .txPreambLength = DWT_PLEN_128,     // Preamble length
+    .rxPAC          = DWT_PAC8,         // PAC size
+    .txCode         = 9,                // Preamble Code 9 (16 MHz PRF)
+    .rxCode         = 9,                // Preamble Code 9 (16 MHz PRF)
+    .sfdType        = 1,                // 1 for DW 8-bit short SFD
+    .dataRate       = DWT_BR_850K,      // 850 Kbps long-range mode
+    .phrMode        = DWT_PHRMODE_STD,  // Standard PHY header
+    .phrRate        = DWT_PHRRATE_STD,  // Standard PHY rate
+    
+    // 🎯 FIX: Expand the SFD Timeout window to handle slow 850 Kbps symbol durations!
+    // Adding 1 to the preamble length configuration prevents premature hardware dropouts.
+    .sfdTO          = (128 + 1 + 8 - 8), 
+    
+    .stsMode        = DWT_STS_MODE_OFF, // STS off
+    .stsLength      = DWT_STS_LEN_64,   // Standard STS buffer layout
+    .pdoaMode       = DWT_PDOA_M0       // Using your header's explicit identifier
+};
+
+
+
+
+#define RX_BUF_LEN 128
+static uint8_t rx_buffer[RX_BUF_LEN];
+
+extern const struct dwt_probe_s dw3000_probe_interf;
+
+void uwb_slave_rx_task(void *pvParameters) {
+    ESP_LOGI("UWB_RX", "Initializing native component hardware layers..."); //
+
+    // 1. Initialize physical pins and single-instance SPI bus
+    int hw_err = dw3000_hw_init(); //
+    if (hw_err != ESP_OK) {
+        ESP_LOGE("UWB_RX", "🛑 CRITICAL: Hardware layer boundary setup failed! Code: %d", hw_err); //
+        vTaskDelete(NULL); //
+        return; //
+    }
+
+    // 2. Clear out transceiver logic states
+    dw3000_hw_reset(); //
+    vTaskDelay(pdMS_TO_TICKS(50)); //
+
+    // 3. Run the driver matching probe routine
+    ESP_LOGI("UWB_RX", "Probing interface layout driver mappings..."); //
+    int32_t probe_rc = dwt_probe((struct dwt_probe_s *)&dw3000_probe_interf); //
+    if (probe_rc != DWT_SUCCESS) {
+        ESP_LOGE("UWB_RX", "🛑 CRITICAL: Qorvo DW3000 interface probe table layout failed! RC: %ld", probe_rc); //
+        vTaskDelete(NULL); //
+        return; //
+    }
+
+    // 4. Run the device register configuration script
+    if (dwt_initialise(DWT_DW_INIT) == DWT_ERROR) { //
+        ESP_LOGE("UWB_RX", "🛑 CRITICAL: DW3000 internal register configuration failed!"); //
+        vTaskDelete(NULL); //
+        return; //
+    }
+
+    // 5. Apply radio channel settings and turn on the receiver engine
+    dwt_configure(&rx_config);
+
+    print_dw3000_config("SLAVE_NODE");
+    
+    // 🎯 Set target address filters for validation 
+    dwt_setpanid(0xDECA);
+    dwt_setaddress16(0x0002);
+
+    // 🎯 Configure frame filter to accept everything (Bypass strict verification)
+    dwt_configureframefilter(0x0, 0x3FF);
+
+    dwt_rxenable(DWT_START_RX_IMMEDIATE);
+    ESP_LOGI("UWB_RX", "🎯 SUCCESS: Slave Transceiver operational and listening...");
+
+   uint32_t loop_counter = 0; // [0x1.4]
+
+    while (1) { // [0x1.4]
+        // Read the live system status register
+        uint32_t status_reg = dwt_read_reg(SYS_STATUS_ID); // [0x1.4]
+        
+        if (loop_counter++ % 150 == 0) { // [0x1.4]
+            ESP_LOGW("UWB_STATUS_DEBUG", "Live SYS_STATUS Register: 0x%08X", (unsigned int)status_reg); // [0x1.4]
+        }
+
+        // 1. Check if a frame is fully ready inside the hardware FIFO
+        // Using RXFR captures packets even if the CRC trailing bytes fluctuate
+        if (status_reg & (DWT_INT_RXFCG_BIT_MASK | 0x00010000)) { 
+            
+            uint32_t rx_finfo = dwt_read_reg(RX_FINFO_ID); // [0x1.4]
+            uint32_t frame_len = rx_finfo & RX_FINFO_RXFLEN_BIT_MASK; // [0x1.4]
+            
+            if (frame_len <= RX_BUF_LEN && frame_len > 11) { // [0x1.5]
+                // Clear your tracking buffer completely before copying new bytes
+                memset(rx_buffer, 0, sizeof(rx_buffer));
+                
+                // Read the exact amount of bytes delivered over the air
+                dwt_readrxdata(rx_buffer, frame_len, 0); // [0x1.5]
+                
+                // Calculate actual payload length (subtract 9 bytes of headers and 2 bytes of CRC)
+                int payload_len = (int)frame_len - 9 - 2;
+                
+                // Ensure we only print if the payload length matches exactly what we expect ("PING" = 4 bytes)
+                if (payload_len == 4) {
+                    char text_payload[5] = {0};
+                    memcpy(text_payload, rx_buffer + 9, 4);
+                    text_payload[4] = '\0';
+                    
+                    // Verify the content matches our transmission string sequence
+                    if (text_payload[0] == 'P' && text_payload[1] == 'I') {
+                        ESP_LOGI("UWB_RX", "🎉 Packet Received! Size: %ld | Data: %s", frame_len, text_payload);
+                    }
+                }
+            }
+            
+            // 2. Clear out ALL active status bits dynamically to reset internal state machines
+            dwt_write_reg(SYS_STATUS_ID, status_reg | 0xFFFFFFFF); 
+            
+            // 3. Free up the dual-bank hardware buffers safely
+            dwt_signal_rx_buff_free(); // [0x1.38]
+            
+            // 4. Force a settling window and re-arm the receiver frontend
+            esp_rom_delay_us(10);
+            dwt_rxenable(DWT_START_RX_IMMEDIATE); // [0x1.5]
+        }
+        
+        // Handle common frame reception timeout errors or broken payload CRC faults cleanly
+        else if (status_reg & (DWT_INT_RXFTO_BIT_MASK | DWT_INT_RXPHE_BIT_MASK | DWT_INT_RXFCE_BIT_MASK | 0x04000000)) { // [0x1.5]
+            dwt_write_reg(SYS_STATUS_ID, status_reg | 0xFFFFFFFF); 
+            dwt_signal_rx_buff_free();
+            esp_rom_delay_us(10);
+            dwt_rxenable(DWT_START_RX_IMMEDIATE); // [0x1.5]
+        }
+        
+        vTaskDelay(1); // [0x1.5]
+    }
+}
+
+
 
 
 // 🎯 UPDATE THIS FUNCTION AT LINE 30 IN YOUR SLAVE FILE:
@@ -160,6 +349,16 @@ void app_main(void) {
     init_barometer();
     init_imu();
 
+    xTaskCreate(
+        uwb_slave_rx_task,    // Function pointer to your UWB receiver task loop
+        "uwb_slave_rx_task",  // Diagnostic text name for FreeRTOS
+        4096,                 // Stack memory size (4KB is safe for UWB operations)
+        NULL,                 // Task input parameters
+        5,                    // Priority lane (Keeps it high enough to capture radio frames)
+        NULL                  // Task handle pointer
+    );
+    ESP_LOGI("SLAVE_MAIN", "🚀 UWB Slave RX Task successfully registered into active lane!");
+
     struct esp_now_payload_t data_packet = {0};
     
     // 🎯 1. ALLOCATE THE EMA FILTER MEMORY TRACKERS
@@ -223,6 +422,6 @@ void app_main(void) {
         // Send the data packet over the air
         esp_now_send(master_mac_address, (uint8_t *)&data_packet, sizeof(data_packet));
         
-        vTaskDelay(pdMS_TO_TICKS(300));
+        vTaskDelay(pdMS_TO_TICKS(3000));
     }
 }
